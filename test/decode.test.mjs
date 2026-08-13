@@ -19,6 +19,7 @@ import {
   FourdgsError,
   MAGIC,
   MalformedFile,
+  RECORD_HEADER_BYTES,
   UnsupportedCodec,
   UnsupportedVersion,
   decodeKeyframeDeltaStreamed,
@@ -531,6 +532,44 @@ describe("§5.5: a chunk's gaussians are invisible outside its interval", () => 
     const playable = await openScene(new BytesReadable(bytes));
     assert.equal(playable.readMode, "streamed");
     assert.ok(playable.notes.some((line) => line.includes("summary CRC")));
+  });
+
+  it("bounds optional streamed-index reads that never settle", async () => {
+    const bytes = withBadSummaryCrc(
+      variant("TenWindows-UseChunkIndex-UseChunks-UseCrc.4dgs").bytes,
+    );
+    class HangingGateReadable extends BytesReadable {
+      gateReads = 0;
+
+      async read(offset, length) {
+        // The optional gate fetches exactly the record framing and fixed Chunk fields.
+        // Earlier open/decode reads still work, so this isolates liveness of that check.
+        if (
+          Number(offset) > 0 &&
+          Number(length) === RECORD_HEADER_BYTES + 24
+        ) {
+          this.gateReads += 1;
+          return new Promise(() => {});
+        }
+        return await super.read(offset, length);
+      }
+    }
+    const source = new HangingGateReadable(bytes);
+    const playable = await openScene(source, { chunkGateTimeoutMs: 10 });
+    assert.equal(playable.readMode, "streamed");
+    assert.equal(source.gateReads, 1, "a timeout must not start the next index read");
+    assert.ok(
+      playable.notes.some((line) =>
+        line.includes("visibility check did not settle within 10 ms"),
+      ),
+      playable.notes.join("\n"),
+    );
+    assert.deepEqual(
+      playable.intervalsAt(0),
+      [],
+      "an index whose physical check timed out cannot label the displayed instant",
+    );
+    assert.ok((await playable.frameAt(0)).count > 0, "the decoded scene remains usable");
   });
 
   it("duplicate Chunk offsets cannot build a streamed interval gate", async () => {

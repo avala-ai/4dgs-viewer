@@ -436,7 +436,7 @@ export class SplatRenderer {
     // Three texels a gaussian, in a texture that is at most `limit` texels each way.
     const supported = Math.floor((limit * limit) / 3);
     if (count > supported) {
-      throw new Error(
+      throw new RendererCapabilityError(
         `this scene has ${count} gaussians alive at one instant, and this device's WebGL2 ` +
           `MAX_TEXTURE_SIZE of ${limit} holds at most ${supported} of them (three texels ` +
           `each) in the one texture this viewer draws from. The file is fine; the page will ` +

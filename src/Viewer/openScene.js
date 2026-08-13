@@ -83,6 +83,11 @@ const MAX_HEADER_RECORD_BYTES = 64 * 1024 * 1024;
 /** Decoded chunks kept on the indexed path. Bounds the memory a long scrub can reach. */
 const CHUNK_CACHE_LIMIT = 64;
 
+/** Longest the optional streamed-index visibility check may delay a usable scene. */
+const CHUNK_GATE_TIMEOUT_MS = 1_500;
+
+const CHUNK_GATE_TIMED_OUT = Symbol("streamed Chunk Index check timed out");
+
 /**
  * The largest truncated `keyframe-delta` prefix this page will read whole.
  *
@@ -166,7 +171,10 @@ class CountingReadable {
  * the most useful thing this page has to say about a file that will not open, and wrapping
  * it in "could not open this file" would throw that away.
  */
-export async function openScene(source) {
+export async function openScene(
+  source,
+  { chunkGateTimeoutMs = CHUNK_GATE_TIMEOUT_MS } = {},
+) {
   const counting = new CountingReadable(source);
   const size = Number(await counting.size());
   // Learn the temporal model before either decoder opens the file. In particular, this
@@ -174,7 +182,7 @@ export async function openScene(source) {
   // `IndexedDecoder.open` is allowed to fetch its content from an untrusted u64 length.
   const temporalModel = await temporalModelOf(counting, size);
   try {
-    return await openGaussianBirth(counting, size);
+    return await openGaussianBirth(counting, size, chunkGateTimeoutMs);
   } catch (refusal) {
     // `decodeScene` and `IndexedDecoder` implement `gaussian-birth`, and they refuse
     // anything else by name. A `keyframe-delta` file lands here.
@@ -223,7 +231,7 @@ async function temporalModelOf(source, size) {
 // gaussian-birth
 // --------------------------------------------------------------------------
 
-async function openGaussianBirth(source, size) {
+async function openGaussianBirth(source, size, chunkGateTimeoutMs) {
   const notes = [];
   try {
     const decoder = await IndexedDecoder.open(source);
@@ -247,7 +255,13 @@ async function openGaussianBirth(source, size) {
     notes.push(`The indexed read path was not usable: ${error.message}`);
   }
   const scene = await decodeScene(source);
-  return await streamedPlayable(scene, source, size, notes);
+  return await streamedPlayable(
+    scene,
+    source,
+    size,
+    notes,
+    chunkGateTimeoutMs,
+  );
 }
 
 /** The cutoff reconstruction actually applies when the Header carries the zero sentinel. */
@@ -339,9 +353,14 @@ function indexedPlayable(decoder, source, notes) {
 }
 
 /** Front to back: the whole scene decoded once, then reconstructed at each instant. */
-async function streamedPlayable(scene, source, size, notes) {
+async function streamedPlayable(scene, source, size, notes, chunkGateTimeoutMs) {
   const cutoff = effectiveCutoff(scene.header);
-  const { gate, why } = await chunkGateOf(scene, source, size);
+  const { gate, why } = await chunkGateOf(
+    scene,
+    source,
+    size,
+    chunkGateTimeoutMs,
+  );
   if (gate === null) {
     notes.push(
       `${why} §5.5 says a chunk's gaussians are invisible outside its [t0, t1); a gaussian ` +
@@ -474,7 +493,8 @@ function frameFromSet(set, objects, t, cutoff, gate) {
  *
  * @returns {Promise<{gate: {t0: Float64Array, t1: Float64Array}|null, why: string}>}
  */
-async function chunkGateOf(scene, source, size) {
+async function chunkGateOf(scene, source, size, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
   const entries = [...scene.chunkIndex].sort(
     (a, b) => a.chunkOffset - b.chunkOffset,
   );
@@ -512,7 +532,20 @@ async function chunkGateOf(scene, source, size) {
   }
 
   for (const entry of entries) {
-    const mismatch = await chunkDisagreement(entry, source, size);
+    const mismatch = await chunkDisagreementWithin(
+      entry,
+      source,
+      size,
+      deadline,
+    );
+    if (mismatch === CHUNK_GATE_TIMED_OUT) {
+      return {
+        gate: null,
+        why:
+          `This file's optional Chunk Index visibility check did not settle within ` +
+          `${timeoutMs} ms, so it cannot decide which decoded gaussians are visible.`,
+      };
+    }
     if (mismatch !== null)
       return { gate: null, why: `This file's ${mismatch}` };
   }
@@ -526,6 +559,29 @@ async function chunkGateOf(scene, source, size) {
     at += entry.gaussianCount;
   }
   return { gate: { t0, t1 }, why: "" };
+}
+
+/**
+ * Check one physical Chunk without allowing the optional gate to delay opening forever.
+ *
+ * `IReadable` has no cancellation contract, so a timed-out read may still settle later.
+ * Racing each read against the one gate-wide deadline means no later validation read is
+ * started after that happens: at most one abandoned transport operation remains.
+ */
+async function chunkDisagreementWithin(entry, source, size, deadline) {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) return CHUNK_GATE_TIMED_OUT;
+  let timer;
+  try {
+    return await Promise.race([
+      chunkDisagreement(entry, source, size),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(CHUNK_GATE_TIMED_OUT), remaining);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**

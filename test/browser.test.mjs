@@ -513,6 +513,7 @@ describe("the viewer in a browser", { skip: available ? false : "no Chrome found
     await page.evaluate(pickFile, `${site.base}/corpus/${VALID}`);
     await page.waitFor(refused, { what: "the texture-limit refusal" });
     const state = await page.evaluate(readState);
+    assert.equal(state.refusalTitle, "RendererCapabilityError");
     assert.match(state.refusalBody, /MAX_TEXTURE_SIZE of 2/);
     assert.match(state.refusalBody, /gaussians alive at one instant/);
     assert.match(state.refusalBody, /The file is fine/);
