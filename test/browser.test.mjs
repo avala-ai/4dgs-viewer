@@ -298,8 +298,13 @@ const TRACK_UPLOADS_AND_FAST_CLOCK = `
 const SHORTEN_FRAME_TIMEOUT = `
   (() => {
     const realSetTimeout = globalThis.setTimeout.bind(globalThis);
+    globalThis.__shortenViewerFrameTimeout = false;
     globalThis.setTimeout = function (callback, delay, ...args) {
-      return realSetTimeout(callback, delay === 15000 ? 75 : delay, ...args);
+      return realSetTimeout(
+        callback,
+        globalThis.__shortenViewerFrameTimeout && delay === 15000 ? 75 : delay,
+        ...args,
+      );
     };
   })();
 `;
@@ -845,6 +850,7 @@ describe("the viewer in a browser", { skip: available ? false : "no Chrome found
     // next Chunk, then prove that one stranded transport promise retires the playable
     // with a diagnosis instead of retaining the pending slot forever.
     await page.evaluate(() => {
+      globalThis.__shortenViewerFrameTimeout = true;
       globalThis.__nextViewerRange = "hang";
       globalThis.__fastViewerClock = true;
       [...document.querySelectorAll("button")].find((button) => button.textContent === "Play").click();
