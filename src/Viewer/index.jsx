@@ -18,7 +18,12 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 
 import { OrbitCamera } from "./camera.js";
 import { frameCamera, lastInstant } from "./framing.js";
-import { ViewerLimitError, effectiveCutoff, openScene } from "./openScene.js";
+import {
+  ViewerLimitError,
+  effectiveCutoff,
+  frameAtWithin,
+  openScene,
+} from "./openScene.js";
 import { SplatRenderer } from "./renderer.js";
 import styles from "./styles.module.css";
 
@@ -215,7 +220,7 @@ export default function Viewer() {
         const targetRenderer = renderer;
         const token = beginFrame(playback, playable, wanted, targetRenderer);
         try {
-          const frame = await playable.frameAt(wanted);
+          const frame = await frameAtWithin(playable, wanted);
           releaseFrame(token);
           const current = playbackRef.current;
           // The instant is part of the result's identity. If the visitor sought while
@@ -256,8 +261,13 @@ export default function Viewer() {
           playback.time += dt;
           if (playback.time >= playable.duration) {
             // The timeline is the half-open [0, duration): the end is never a valid instant.
-            playback.time = playback.loop ? 0 : lastInstant(playable.duration);
-            if (!playback.loop) {
+            if (playback.loop) {
+              // Loop wrap is a discontinuous seek. A read for the old end may never
+              // settle, so release its slot before requesting the start again.
+              invalidateFrame();
+              playback.time = 0;
+            } else {
+              playback.time = lastInstant(playable.duration);
               playback.playing = false;
               setPlaying(false);
             }
@@ -273,8 +283,7 @@ export default function Viewer() {
           const wanted = playback.time;
           const targetRenderer = renderer;
           const token = beginFrame(playback, playable, wanted, targetRenderer);
-          playable
-            .frameAt(wanted)
+          frameAtWithin(playable, wanted)
             .then((frame) => {
               releaseFrame(token);
               if (!frameIsCurrent(token)) return;

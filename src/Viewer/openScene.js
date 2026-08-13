@@ -100,6 +100,36 @@ export class ViewerLimitError extends Error {
   }
 }
 
+/** Longest one displayed-frame read may monopolize the viewer's pending slot. */
+export const FRAME_READ_TIMEOUT_MS = 15_000;
+
+/**
+ * Read one displayed frame with a fixed liveness bound.
+ *
+ * IReadable deliberately has no transport cancellation contract. The underlying operation
+ * may therefore settle later, but Promise.race owns no publication path: the render loop's
+ * token decides that separately, and a timeout retires this playable. This leaves at most
+ * one abandoned transport promise rather than starting a new one on every animation frame.
+ */
+export async function frameAtWithin(playable, wanted, timeoutMs = FRAME_READ_TIMEOUT_MS) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      reject(
+        new ViewerLimitError(
+          `frame at ${wanted} s did not settle within ${timeoutMs / 1000} seconds; ` +
+            "playback stopped rather than retaining an unbounded pending read",
+        ),
+      );
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([Promise.resolve().then(() => playable.frameAt(wanted)), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /**
  * Counts what the transport actually moved.
  *

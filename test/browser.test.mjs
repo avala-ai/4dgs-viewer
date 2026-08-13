@@ -201,6 +201,16 @@ const TRACK_UPLOADS_AND_FAST_CLOCK = `
   })();
 `;
 
+/** Keep the production bound visible in the error while making the browser test immediate. */
+const SHORTEN_FRAME_TIMEOUT = `
+  (() => {
+    const realSetTimeout = globalThis.setTimeout.bind(globalThis);
+    globalThis.setTimeout = function (callback, delay, ...args) {
+      return realSetTimeout(callback, delay === 15000 ? 75 : delay, ...args);
+    };
+  })();
+`;
+
 /** Seek to a fraction of the file's duration through the viewer's real control. */
 function seekFraction(fraction) {
   const scrub = document.querySelector('input[type="range"]');
@@ -595,6 +605,64 @@ describe("the viewer in a browser", { skip: available ? false : "no Chrome found
     await page.waitFor(
       () => globalThis.__viewerFrameUploads > globalThis.__uploadsBeforeReplay,
       { what: "a frame published after replay released the stranded final read" },
+    );
+    await page.close();
+  });
+
+  it("bounds a never-settling range started during ordinary playback", async () => {
+    const page = await viewer(
+      CONTROL_NEXT_RANGE,
+      TRACK_UPLOADS_AND_FAST_CLOCK,
+      SHORTEN_FRAME_TIMEOUT,
+    );
+    await page.evaluate(openUrl, `${site.base}/range/${MULTI_CHUNK}`);
+    await page.waitFor(opened, { what: "the URL-backed scene" });
+
+    // The landing Chunk is cached. Advance rapidly until playback itself requests the
+    // next Chunk, then prove that one stranded transport promise retires the playable
+    // with a diagnosis instead of retaining the pending slot forever.
+    await page.evaluate(() => {
+      globalThis.__nextViewerRange = "hang";
+      globalThis.__fastViewerClock = true;
+      [...document.querySelectorAll("button")].find((button) => button.textContent === "Play").click();
+      return true;
+    });
+    await page.waitFor(() => globalThis.__viewerRangeHung === 1, {
+      what: "the playback-driven range to become stranded",
+    });
+    await page.waitFor(
+      () => document.querySelector("pre")?.textContent.includes("did not settle within 15 seconds"),
+      { what: "the bounded frame-read refusal" },
+    );
+    const state = await page.evaluate(readState);
+    assert.equal(state.refusalTitle, "ViewerLimitError");
+    assert.equal(state.fileDisabled, false);
+    assert.equal(state.playDisabled, true);
+    assert.equal(state.scrubDisabled, true);
+    await page.close();
+  });
+
+  it("releases a pending end read when looping wraps to the start", async () => {
+    const page = await viewer(CONTROL_NEXT_RANGE, TRACK_UPLOADS_AND_FAST_CLOCK);
+    await page.evaluate(openUrl, `${site.base}/range/${MULTI_CHUNK}`);
+    await page.waitFor(opened, { what: "the URL-backed scene" });
+    await page.evaluate(() => {
+      globalThis.__nextViewerRange = "hang";
+      return true;
+    });
+    await page.evaluate(seekFraction, 0.75);
+    await page.waitFor(() => globalThis.__viewerRangeHung === 1, {
+      what: "the intentionally stranded end-range read",
+    });
+    await page.evaluate(() => {
+      globalThis.__uploadsBeforeLoop = globalThis.__viewerFrameUploads;
+      globalThis.__fastViewerClock = true;
+      [...document.querySelectorAll("button")].find((button) => button.textContent === "Play").click();
+      return true;
+    });
+    await page.waitFor(
+      () => globalThis.__viewerFrameUploads > globalThis.__uploadsBeforeLoop,
+      { what: "a frame published after loop wrap released the stranded end read" },
     );
     await page.close();
   });

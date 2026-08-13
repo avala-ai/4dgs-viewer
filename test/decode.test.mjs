@@ -29,6 +29,7 @@ import {
   ViewerLimitError,
   concatSh,
   effectiveCutoff,
+  frameAtWithin,
   openScene,
 } from "../src/Viewer/openScene.js";
 import { frameCamera } from "../src/Viewer/framing.js";
@@ -76,6 +77,26 @@ describe("Header defaults shown by the viewer", () => {
   it("reports the effective marginal cutoff, including the zero sentinel", () => {
     assert.equal(effectiveCutoff({ cutoff: 0 }), DEFAULT_CUTOFF);
     assert.equal(effectiveCutoff({ cutoff: 0.125 }), 0.125);
+  });
+});
+
+describe("displayed frame reads have a liveness bound", () => {
+  it("retires one never-settling read without polling or accumulating promises", async () => {
+    let calls = 0;
+    const playable = {
+      frameAt() {
+        calls += 1;
+        return new Promise(() => {});
+      },
+    };
+    await assert.rejects(
+      () => frameAtWithin(playable, 1.25, 10),
+      (error) =>
+        error instanceof ViewerLimitError &&
+        error.message.includes("frame at 1.25 s") &&
+        error.message.includes("within 0.01 seconds"),
+    );
+    assert.equal(calls, 1);
   });
 });
 
