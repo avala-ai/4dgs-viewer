@@ -464,6 +464,9 @@ export default function Viewer() {
     // contains. Starting from there would reach the duration on the first tick and stop
     // again, so Play from the end means play it again rather than nothing at all.
     if (!playback.playing && playback.time >= lastInstant(playback.playable.duration)) {
+      // A URL range for that final instant may never settle. Replaying is a discontinuous
+      // seek just like moving the scrubber, so it must release that request's pending slot.
+      frameRequestRef.current();
       playback.time = 0;
     }
     playback.playing = !playback.playing;

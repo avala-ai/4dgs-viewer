@@ -741,4 +741,33 @@ describe("indexed SH bands agree with the Header", () => {
         error.message.includes("Header declares SH degree 3"),
     );
   });
+
+  it("refuses a non-empty Chunk whose physical bands exceed Header.sh_degree", async () => {
+    const whole = variant("MixedLifetimes-SHDegree2-UseChunkIndex-UseCrc.4dgs");
+    const bytes = withHeaderShDegree(whole.bytes, 1);
+    const playable = await openScene(new BytesReadable(bytes));
+    assert.equal(playable.readMode, "indexed");
+    await assert.rejects(
+      () => playable.frameAt(0),
+      (error) =>
+        error instanceof MalformedFile &&
+        error.message.includes("decodes SH degree 2") &&
+        error.message.includes("Header declares SH degree 1"),
+    );
+  });
+});
+
+describe("indexed Chunk cache identities are unique", () => {
+  it("refuses a CRC-valid index that names one physical Chunk twice", async () => {
+    const whole = variant("TenWindows-UseChunkIndex-UseChunks-UseCrc.4dgs");
+    const { bytes, duplicateOffset } = withDuplicateIndexOffset(whole.bytes);
+    const playable = await openScene(new BytesReadable(bytes));
+    assert.equal(playable.readMode, "indexed");
+    await assert.rejects(
+      () => playable.frameAt(0),
+      (error) =>
+        error instanceof MalformedFile &&
+        error.message.includes(`both name chunk_offset ${duplicateOffset}`),
+    );
+  });
 });

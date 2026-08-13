@@ -174,6 +174,33 @@ const CONTROL_NEXT_RANGE = `
   })();
 `;
 
+/** Observe frame publication and let a replay advance without waiting scene-time seconds. */
+const TRACK_UPLOADS_AND_FAST_CLOCK = `
+  (() => {
+    const realUpload = WebGL2RenderingContext.prototype.texSubImage2D;
+    globalThis.__viewerFrameUploads = 0;
+    WebGL2RenderingContext.prototype.texSubImage2D = function (...args) {
+      globalThis.__viewerFrameUploads += 1;
+      return realUpload.apply(this, args);
+    };
+
+    const realAnimationFrame = globalThis.requestAnimationFrame.bind(globalThis);
+    let syntheticNow = performance.now();
+    globalThis.__fastViewerClock = false;
+    globalThis.requestAnimationFrame = function (callback) {
+      return realAnimationFrame((now) => {
+        if (globalThis.__fastViewerClock) {
+          syntheticNow = Math.max(syntheticNow, now) + 250;
+          callback(syntheticNow);
+        } else {
+          syntheticNow = now;
+          callback(now);
+        }
+      });
+    };
+  })();
+`;
+
 /** Seek to a fraction of the file's duration through the viewer's real control. */
 function seekFraction(fraction) {
   const scrub = document.querySelector('input[type="range"]');
@@ -541,6 +568,33 @@ describe("the viewer in a browser", { skip: available ? false : "no Chrome found
         return Number(live?.nextElementSibling?.textContent.replace(/,/g, "")) === 19;
       },
       { what: "a second seek past the still-stranded read" },
+    );
+    await page.close();
+  });
+
+  it("releases a never-settling final frame when Play restarts the scene", async () => {
+    const page = await viewer(CONTROL_NEXT_RANGE, TRACK_UPLOADS_AND_FAST_CLOCK);
+    await page.evaluate(openUrl, `${site.base}/range/${MULTI_CHUNK}`);
+    await page.waitFor(opened, { what: "the URL-backed scene" });
+
+    await page.evaluate(() => {
+      globalThis.__nextViewerRange = "hang";
+      return true;
+    });
+    await page.evaluate(seekFraction, 1);
+    await page.waitFor(() => globalThis.__viewerRangeHung === 1, {
+      what: "the intentionally stranded final-frame range",
+    });
+
+    await page.evaluate(() => {
+      globalThis.__uploadsBeforeReplay = globalThis.__viewerFrameUploads;
+      globalThis.__fastViewerClock = true;
+      [...document.querySelectorAll("button")].find((button) => button.textContent === "Play").click();
+      return true;
+    });
+    await page.waitFor(
+      () => globalThis.__viewerFrameUploads > globalThis.__uploadsBeforeReplay,
+      { what: "a frame published after replay released the stranded final read" },
     );
     await page.close();
   });

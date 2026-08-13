@@ -25,6 +25,7 @@ import {
   IndexedDecoder,
   KeyframeDeltaIndexedDecoder,
   MAGIC,
+  MAX_SH_DEGREE,
   MalformedFile,
   Opcode,
   RECORD_HEADER_BYTES,
@@ -231,6 +232,20 @@ function indexedPlayable(decoder, source, notes) {
   const chunks = new Map();
   let assembled = { key: null, set: null };
   let objectsPromise = null;
+  let duplicateIndex = null;
+  const offsets = new Map();
+  for (let position = 0; position < decoder.index.length; position++) {
+    const entry = decoder.index[position];
+    const first = offsets.get(entry.chunkOffset);
+    if (first !== undefined) {
+      duplicateIndex = new MalformedFile(
+        `Chunk Index entries ${first} and ${position} both name chunk_offset ` +
+          `${entry.chunkOffset}; each physical Chunk may appear only once`,
+      );
+      break;
+    }
+    offsets.set(entry.chunkOffset, position);
+  }
 
   // Object-layer records live outside Chunk ranges and are deliberately deferred by the
   // indexed decoder. Fetch them only when the first frame is requested, then reuse the
@@ -238,6 +253,10 @@ function indexedPlayable(decoder, source, notes) {
   const objects = () => (objectsPromise ??= decoder.readObjects());
 
   async function setFor(t) {
+    // Defer this file verdict until frameAt so IndexedDecoder.open remains an indexed
+    // success rather than letting openGaussianBirth reinterpret it as an absent index and
+    // silently fall back to streaming.
+    if (duplicateIndex !== null) throw duplicateIndex;
     // The normative seek rule, and the whole of it. `chunksForTime` is `t0 <= t < t1`.
     const entries = decoder.chunksForTime(t);
     const key = entries.map((entry) => entry.chunkOffset).join(",");
@@ -247,7 +266,10 @@ function indexedPlayable(decoder, source, notes) {
     for (const entry of entries) {
       let chunk = chunks.get(entry.chunkOffset);
       if (chunk === undefined) {
-        chunk = await decoder.readChunk(entry, { maxShBand: header.shDegree });
+        // Decode every physical band before comparing with the Header. Applying
+        // maxShBand first would make a degree-2 Chunk look like degree 1 and accept its
+        // undeclared extra records. The format's degree ceiling keeps this read bounded.
+        chunk = await decoder.readChunk(entry, { maxShBand: MAX_SH_DEGREE });
         const decodedDegree = chunk.sh?.degree ?? 0;
         if (chunk.gaussians.count > 0 && decodedDegree !== header.shDegree) {
           throw new MalformedFile(

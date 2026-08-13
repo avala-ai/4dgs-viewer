@@ -86,6 +86,7 @@ export function withDuplicateIndexOffset(bytes) {
     BigInt(first.chunkOffset),
     true,
   );
+  refreshSummaryCrc(out);
   return { bytes: out, duplicateOffset: first.chunkOffset };
 }
 
