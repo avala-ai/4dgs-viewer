@@ -156,6 +156,14 @@ const SH_C3 = [
   -0.4570457994644658, 1.445305721320277, -0.5900435899266435,
 ];
 
+/** A WebGL device limit or allocation failure, not a verdict about the file's bytes. */
+export class RendererCapabilityError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "RendererCapabilityError";
+  }
+}
+
 export class SplatRenderer {
   constructor(canvas) {
     const gl = canvas.getContext("webgl2", {
@@ -165,7 +173,7 @@ export class SplatRenderer {
       preserveDrawingBuffer: false,
     });
     if (gl === null) {
-      throw new Error(
+      throw new RendererCapabilityError(
         "this browser did not give the page a WebGL2 context, which the viewer needs",
       );
     }
@@ -436,40 +444,73 @@ export class SplatRenderer {
       );
     }
     const capacity = Math.min(supported, Math.max(count, TEXTURE_WIDTH, this.capacity * 2));
-    this.geometryLayout = layoutFor(capacity * 3, limit);
-    this.colourLayout = layoutFor(capacity, limit);
-    this.capacity = capacity;
+    const geometryLayout = layoutFor(capacity * 3, limit);
+    const colourLayout = layoutFor(capacity, limit);
     // Whole rows, so a partial `texSubImage2D` always has the bytes it says it has.
-    this.geometryData = new Float32Array(this.geometryLayout.texels * 4);
-    this.colourData = new Uint8Array(this.colourLayout.texels * 4);
-    this.depths = new Float32Array(this.capacity);
-    this.order = new Uint32Array(this.capacity);
+    const geometryData = new Float32Array(geometryLayout.texels * 4);
+    const colourData = new Uint8Array(colourLayout.texels * 4);
+    const depths = new Float32Array(capacity);
+    const order = new Uint32Array(capacity);
 
     const gl = this.gl;
-    gl.bindTexture(gl.TEXTURE_2D, this.geometryTexture);
+    // Allocate into new textures so a failed growth cannot destroy the last working
+    // allocation or publish a capacity that later calls incorrectly consider available.
+    const geometryTexture = createTexture(gl);
+    const colourTexture = createTexture(gl);
+    while (gl.getError() !== gl.NO_ERROR) {
+      // Attribute following errors to these allocations, not to a stale earlier call.
+    }
+    gl.bindTexture(gl.TEXTURE_2D, geometryTexture);
     gl.texImage2D(
       gl.TEXTURE_2D,
       0,
       gl.RGBA32F,
-      this.geometryLayout.width,
-      this.geometryLayout.rows,
+      geometryLayout.width,
+      geometryLayout.rows,
       0,
       gl.RGBA,
       gl.FLOAT,
       null,
     );
-    gl.bindTexture(gl.TEXTURE_2D, this.colourTexture);
+    let allocationError = gl.getError();
+    gl.bindTexture(gl.TEXTURE_2D, colourTexture);
     gl.texImage2D(
       gl.TEXTURE_2D,
       0,
       gl.RGBA8,
-      this.colourLayout.width,
-      this.colourLayout.rows,
+      colourLayout.width,
+      colourLayout.rows,
       0,
       gl.RGBA,
       gl.UNSIGNED_BYTE,
       null,
     );
+    const colourAllocationError = gl.getError();
+    if (allocationError === gl.NO_ERROR) allocationError = colourAllocationError;
+    if (allocationError !== gl.NO_ERROR) {
+      gl.deleteTexture(geometryTexture);
+      gl.deleteTexture(colourTexture);
+      const why =
+        allocationError === gl.OUT_OF_MEMORY
+          ? "the device reported OUT_OF_MEMORY"
+          : `WebGL reported error 0x${allocationError.toString(16)}`;
+      throw new RendererCapabilityError(
+        `WebGL2 could not allocate textures for ${capacity} live gaussians: ${why}. ` +
+          "The file is fine; this device does not have enough available GPU capacity.",
+      );
+    }
+
+    gl.deleteTexture(this.geometryTexture);
+    gl.deleteTexture(this.colourTexture);
+    this.geometryTexture = geometryTexture;
+    this.colourTexture = colourTexture;
+    this.geometryLayout = geometryLayout;
+    this.colourLayout = colourLayout;
+    this.geometryData = geometryData;
+    this.colourData = colourData;
+    this.depths = depths;
+    this.order = order;
+    this.capacity = capacity;
     this.colouredForFrame = -1;
   }
 }

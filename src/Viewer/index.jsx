@@ -24,7 +24,7 @@ import {
   frameAtWithin,
   openScene,
 } from "./openScene.js";
-import { SplatRenderer } from "./renderer.js";
+import { RendererCapabilityError, SplatRenderer } from "./renderer.js";
 import styles from "./styles.module.css";
 
 /** How often the readouts under the canvas are allowed to re-render, in milliseconds. */
@@ -129,12 +129,12 @@ export default function Viewer() {
      */
     let frameGeneration = 0;
     let pendingFrame = null;
+    const supersededFrames = new Set();
 
     const invalidateFrame = () => {
       frameGeneration += 1;
       pendingFrame = null;
     };
-    frameRequestRef.current = invalidateFrame;
 
     const beginFrame = (playback, playable, wanted, targetRenderer) => {
       const token = {
@@ -148,8 +148,20 @@ export default function Viewer() {
       return token;
     };
     const releaseFrame = (token) => {
+      supersededFrames.delete(token);
       if (pendingFrame === token) pendingFrame = null;
     };
+    const supersedeFrame = () => {
+      // IReadable has no cancellation contract. Permit one replacement request for
+      // responsiveness, then coalesce later scrub changes behind it until the abandoned
+      // wrapper settles or times out. This caps transport operations at one active plus
+      // one superseded however many change events a pointer drag produces.
+      if (pendingFrame === null || supersededFrames.size > 0) return;
+      supersededFrames.add(pendingFrame);
+      frameGeneration += 1;
+      pendingFrame = null;
+    };
+    frameRequestRef.current = supersedeFrame;
     const frameIsCurrent = (token) => {
       const playback = playbackRef.current;
       return (
@@ -679,6 +691,7 @@ export default function Viewer() {
  */
 const REFUSAL_NAMES = [
   [ViewerLimitError, "ViewerLimitError"],
+  [RendererCapabilityError, "RendererCapabilityError"],
   [ViewerCapabilityError, "ViewerCapabilityError"],
   [MalformedFile, "MalformedFile"],
   [TruncatedFile, "TruncatedFile"],

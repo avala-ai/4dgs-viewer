@@ -128,6 +128,32 @@ const forceTextureLimit = (limit) => `
   })();
 `;
 
+/** Make the first requested texture allocation report WebGL OUT_OF_MEMORY. */
+const FAIL_FIRST_TEXTURE_ALLOCATION = `
+  (() => {
+    const realImage = WebGL2RenderingContext.prototype.texImage2D;
+    const realError = WebGL2RenderingContext.prototype.getError;
+    globalThis.__failViewerTextureAllocation = true;
+    let error = 0;
+    WebGL2RenderingContext.prototype.texImage2D = function (...args) {
+      if (globalThis.__failViewerTextureAllocation) {
+        globalThis.__failViewerTextureAllocation = false;
+        error = this.OUT_OF_MEMORY;
+        return;
+      }
+      return realImage.apply(this, args);
+    };
+    WebGL2RenderingContext.prototype.getError = function () {
+      if (error !== 0) {
+        const result = error;
+        error = 0;
+        return result;
+      }
+      return realError.call(this);
+    };
+  })();
+`;
+
 /** Let a test turn otherwise valid URL range reads into transport failures. */
 const FAIL_RANGES_ON_DEMAND = `
   (() => {
@@ -493,6 +519,25 @@ describe("the viewer in a browser", { skip: available ? false : "no Chrome found
     await page.close();
   });
 
+  it("refuses a failed GPU texture allocation without committing its capacity", async () => {
+    const page = await viewer(FAIL_FIRST_TEXTURE_ALLOCATION);
+    await page.evaluate(pickFile, `${site.base}/corpus/${VALID}`);
+    await page.waitFor(refused, { what: "the texture-allocation refusal" });
+    const failed = await page.evaluate(readState);
+    assert.equal(failed.refusalTitle, "RendererCapabilityError");
+    assert.match(failed.refusalBody, /OUT_OF_MEMORY/);
+    assert.equal(failed.fileDisabled, false);
+    assert.equal(failed.playDisabled, true);
+
+    // The failed size was not committed. Selecting the same file retries both real
+    // allocations and reaches a playable scene instead of skipping ensureCapacity.
+    await page.evaluate(pickFile, `${site.base}/corpus/${VALID}`);
+    await page.waitFor(opened, { what: "the scene after retrying texture allocation" });
+    const retried = await page.evaluate(readState);
+    assert.equal(retried.refusalTitle, null);
+    await page.close();
+  });
+
   it("owns the canvas wheel gesture instead of scrolling the document", async () => {
     const page = await viewer();
     await page.waitFor(
@@ -604,6 +649,27 @@ describe("the viewer in a browser", { skip: available ? false : "no Chrome found
       },
       { what: "a second seek past the still-stranded read" },
     );
+    await page.close();
+  });
+
+  it("coalesces a rapid scrub behind at most one superseded range", async () => {
+    const page = await viewer(CONTROL_NEXT_RANGE);
+    await page.evaluate(openUrl, `${site.base}/range/${MULTI_CHUNK}`);
+    await page.waitFor(opened, { what: "the URL-backed scene" });
+    await page.evaluate(() => {
+      globalThis.__hangAllViewerRanges = true;
+      return true;
+    });
+    await page.evaluate(seekFraction, 0.75);
+    await page.waitFor(() => globalThis.__viewerRangeHung === 1);
+    await page.evaluate(seekFraction, 0.25);
+    await page.waitFor(() => globalThis.__viewerRangeHung === 2);
+    for (const fraction of [0.6, 0.1, 0.9, 0.4, 0.8, 0.2]) {
+      await page.evaluate(seekFraction, fraction);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    const hung = await page.evaluate(() => globalThis.__viewerRangeHung);
+    assert.equal(hung, 2, "one active plus one superseded transport is the hard ceiling");
     await page.close();
   });
 

@@ -548,6 +548,11 @@ describe("§5.5: a chunk's gaussians are invisible outside its interval", () => 
           line.includes("one to one"),
       ),
     );
+    assert.deepEqual(
+      playable.intervalsAt(0),
+      [],
+      "an index rejected for visibility cannot still label the displayed instant",
+    );
   });
 });
 

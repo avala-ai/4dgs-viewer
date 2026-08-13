@@ -368,10 +368,13 @@ async function streamedPlayable(scene, source, size, notes) {
     duration: scene.header.durationSec,
     frameAt: async (t) =>
       frameFromSet(scene.gaussians, scene.objects, t, cutoff, gate),
-    intervalsAt: (t) =>
-      scene.chunkIndex
-        .filter((e) => e.t0 <= t && t < e.t1)
-        .map(({ t0, t1 }) => ({ t0, t1 })),
+    intervalsAt:
+      gate === null
+        ? () => []
+        : (t) =>
+            scene.chunkIndex
+              .filter((e) => e.t0 <= t && t < e.t1)
+              .map(({ t0, t1 }) => ({ t0, t1 })),
     transfer: () => transferOf(source),
     notes,
   };
