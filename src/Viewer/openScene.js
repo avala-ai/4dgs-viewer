@@ -815,9 +815,7 @@ async function claimsTerminalFooter(source, size) {
   if (size < FOOTER_TAIL_BYTES) return false;
   const offset = size - FOOTER_TAIL_BYTES;
   const tail = await source.read(BigInt(offset), BigInt(FOOTER_TAIL_BYTES));
-  if (tail.length !== FOOTER_TAIL_BYTES || !endsWithMagic(tail)) {
-    return false;
-  }
+  if (tail.length !== FOOTER_TAIL_BYTES) return false;
   try {
     const cursor = new Cursor(tail, 0, offset);
     const opcode = cursor.u8();
@@ -831,14 +829,6 @@ async function claimsTerminalFooter(source, size) {
     // claim, and the indexed decoder will name that malformed u64 precisely.
     return tail[0] === Opcode.Footer;
   }
-}
-
-function endsWithMagic(data) {
-  if (data.length < MAGIC.length) return false;
-  const at = data.length - MAGIC.length;
-  for (let i = 0; i < MAGIC.length; i++)
-    if (data[at + i] !== MAGIC[i]) return false;
-  return true;
 }
 
 function transferOf(source) {

@@ -30,7 +30,8 @@ export async function frameCamera(
   // A file the visitor has already moved on from does not get to put a frame on the canvas
   // or move the camera; its caller will discard the rest of this open too.
   if (!isCurrent()) return [];
-  currentRenderer()?.setFrame(first);
+  const landingRenderer = currentRenderer();
+  landingRenderer?.setFrame(first);
   if (camera === null) return [];
 
   const warnings = [];
@@ -56,6 +57,11 @@ export async function frameCamera(
     }
   }
   if (!isCurrent()) return [];
+  // WebGL may have restored while an optional probe was in flight. Its replacement
+  // renderer has no GPU copy of time zero; reinstall that landing answer before the
+  // caller marks zero rendered. Avoid a duplicate upload when the renderer is unchanged.
+  const settledRenderer = currentRenderer();
+  if (settledRenderer !== landingRenderer) settledRenderer?.setFrame(first);
   // Fixed probes can all miss a narrow visibility interval. The Header AABB is scene-wide
   // and is therefore the authoritative fallback for a sparse but otherwise valid scene.
   const framing = bounds ?? boundsFromAabb(playable.header?.aabb);

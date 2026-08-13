@@ -260,7 +260,11 @@ export default function Viewer() {
         } catch (failure) {
           releaseFrame(token);
           const current = playbackRef.current;
-          if (!frameIsCurrent(token) || current.time !== wanted) return;
+          if (
+            !frameIsCurrent(token) ||
+            (current.time !== wanted && !(failure instanceof ViewerLimitError))
+          )
+            return;
           current.playable = null;
           targetRenderer.clear();
           setPlaying(false);
@@ -323,7 +327,15 @@ export default function Viewer() {
             .catch((failure) => {
               releaseFrame(token);
               const current = playbackRef.current;
-              if (!frameIsCurrent(token) || current.time !== wanted) return;
+              // A fulfilled old instant is stale after a coalesced seek. A timeout from
+              // the current-generation replacement is different: its uncancellable
+              // transport remains stranded, so ignoring it would let the next tick add
+              // another stranded range. Retire the playable whatever time is now wanted.
+              if (
+                !frameIsCurrent(token) ||
+                (current.time !== wanted && !(failure instanceof ViewerLimitError))
+              )
+                return;
               current.playable = null;
               current.playing = false;
               targetRenderer.clear();

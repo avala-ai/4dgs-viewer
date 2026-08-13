@@ -427,3 +427,10 @@ export function withCorruptTerminalFooter(bytes, field) {
   }
   return out;
 }
+
+/** Damage only the trailing marker while retaining the fixed terminal Footer claim. */
+export function withCorruptTerminalMagic(bytes) {
+  const out = bytes.slice();
+  out[out.length - 1] ^= 0xff;
+  return out;
+}

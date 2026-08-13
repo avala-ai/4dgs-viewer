@@ -320,10 +320,13 @@ const SHORTEN_FRAME_TIMEOUT = `
   (() => {
     const realSetTimeout = globalThis.setTimeout.bind(globalThis);
     globalThis.__shortenViewerFrameTimeout = false;
+    globalThis.__viewerShortFrameTimeoutMs = 75;
     globalThis.setTimeout = function (callback, delay, ...args) {
       return realSetTimeout(
         callback,
-        globalThis.__shortenViewerFrameTimeout && delay === 15000 ? 75 : delay,
+        globalThis.__shortenViewerFrameTimeout && delay === 15000
+          ? globalThis.__viewerShortFrameTimeoutMs
+          : delay,
         ...args,
       );
     };
@@ -908,10 +911,12 @@ describe("the viewer in a browser", { skip: available ? false : "no Chrome found
   });
 
   it("coalesces a rapid scrub behind at most one superseded range", async () => {
-    const page = await viewer(CONTROL_NEXT_RANGE);
+    const page = await viewer(CONTROL_NEXT_RANGE, SHORTEN_FRAME_TIMEOUT);
     await page.evaluate(openUrl, `${site.base}/range/${MULTI_CHUNK}`);
     await page.waitFor(opened, { what: "the URL-backed scene" });
     await page.evaluate(() => {
+      globalThis.__shortenViewerFrameTimeout = true;
+      globalThis.__viewerShortFrameTimeoutMs = 1500;
       globalThis.__hangAllViewerRanges = true;
       return true;
     });
@@ -925,6 +930,17 @@ describe("the viewer in a browser", { skip: available ? false : "no Chrome found
     }
     const hung = await page.evaluate(() => globalThis.__viewerRangeHung);
     assert.equal(hung, 2, "one active plus one superseded transport is the hard ceiling");
+    await page.waitFor(
+      () =>
+        document.querySelector("pre")?.textContent.includes("did not settle within 15 seconds"),
+      { what: "the current replacement timeout after coalesced seeks" },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    assert.equal(
+      await page.evaluate(() => globalThis.__viewerRangeHung),
+      2,
+      "an authoritative replacement timeout must not start a third stranded range",
+    );
     await page.close();
   });
 

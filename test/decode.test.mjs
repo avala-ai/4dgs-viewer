@@ -51,6 +51,7 @@ import {
   cutAfterChunk,
   withBadSummaryCrc,
   withCorruptTerminalFooter,
+  withCorruptTerminalMagic,
   withDuplicateIndexOffset,
   withHeaderDuration,
   withHeaderShDegree,
@@ -269,6 +270,45 @@ describe("camera framing survives asynchronous and sparse opens", () => {
         error.message.includes("within 0.01 seconds"),
     );
     assert.equal(calls, 1, "landing timeout must not poll the stranded range");
+  });
+
+  it("reinstalls the landing frame when the renderer changes during optional probes", async () => {
+    let probeStarted;
+    const started = new Promise((resolve) => {
+      probeStarted = resolve;
+    });
+    let releaseProbe;
+    const probe = new Promise((resolve) => {
+      releaseProbe = resolve;
+    });
+    const bounded = {
+      count: 1,
+      centers: new Float32Array([1, 2, 3]),
+    };
+    const installed = { old: [], current: [] };
+    const oldRenderer = { setFrame: (frame) => installed.old.push(frame) };
+    const newRenderer = { setFrame: (frame) => installed.current.push(frame) };
+    let renderer = oldRenderer;
+    const framing = frameCamera(
+      {
+        duration: 1,
+        header: { aabb: [0, 0, 0, 1, 1, 1] },
+        frameAt(t) {
+          if (t === 0) return Promise.resolve(empty);
+          probeStarted();
+          return probe;
+        },
+      },
+      () => renderer,
+      { frame() {} },
+      () => true,
+    );
+    await started;
+    renderer = newRenderer;
+    releaseProbe(bounded);
+    await framing;
+    assert.deepEqual(installed.old, [empty]);
+    assert.deepEqual(installed.current, [empty]);
   });
 
   it("falls back to the Header AABB when fixed probes miss sparse visibility", async () => {
@@ -754,6 +794,16 @@ describe("§11.10: a keyframe-delta timeline ends where its chunks do", () => {
       );
     });
   }
+
+  it("refuses a complete Footer claim whose terminal magic is corrupt", async () => {
+    const bytes = withCorruptTerminalMagic(variant(source).bytes);
+    await assert.rejects(
+      () => openScene(new BytesReadable(bytes)),
+      (error) =>
+        error instanceof MalformedFile &&
+        error.message.includes("does not end with the magic"),
+    );
+  });
 
   it("storage order is not time order: coverage comes from the largest t1", async () => {
     const whole = variant(source);
