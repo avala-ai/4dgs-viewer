@@ -41,6 +41,8 @@ export default function Viewer() {
   const dragRef = useRef(null);
   /** True only between pointer-down and pointer-up on the scrubber. */
   const draggingScrubRef = useRef(false);
+  /** Readout time visible when the most recent keyboard scrub was issued. */
+  const keyboardScrubReadoutRef = useRef(null);
   /**
    * Why this browser cannot draw anything, if it cannot.
    *
@@ -452,10 +454,22 @@ export default function Viewer() {
     playbackRef.current.loop = loop;
   }, [loop]);
 
+  useEffect(() => {
+    if (
+      !draggingScrubRef.current &&
+      scrub !== null &&
+      keyboardScrubReadoutRef.current !== null &&
+      readout.time !== keyboardScrubReadoutRef.current
+    ) {
+      keyboardScrubReadoutRef.current = null;
+      setScrub(null);
+    }
+  }, [readout.time, scrub]);
+
   // --- markup --------------------------------------------------------------
 
   const duration = scene === null ? 0 : scene.duration;
-  const playableNow = scene !== null && duration > 0 && !decodeFailed;
+  const playableNow = scene !== null && duration > 0 && !decodeFailed && !setupFailed;
 
   return (
     <div className={styles.viewer}>
@@ -511,28 +525,34 @@ export default function Viewer() {
           step={duration > 0 ? duration / 2000 : 0.001}
           value={scrub ?? readout.time}
           disabled={!playableNow}
-          // The override exists so a dragging thumb is not yanked back by the readout, and
-          // it lasts exactly as long as the drag. An arrow key is not a drag: it seeks, and
-          // the slider goes straight back to following playback, so the next key press
-          // starts from where the scene actually is rather than from a frozen value.
+          // Pointer drags retain their override until release. Keyboard changes retain it
+          // until the throttled readout advances, so repeated arrow events accumulate from
+          // the controlled value instead of React restoring the same stale readout value.
           onPointerDown={() => {
             draggingScrubRef.current = true;
+            keyboardScrubReadoutRef.current = null;
           }}
           onChange={(event) => {
             const value = Number(event.target.value);
-            setScrub(draggingScrubRef.current ? value : null);
+            if (!draggingScrubRef.current) {
+              keyboardScrubReadoutRef.current = readout.time;
+            }
+            setScrub(value);
             seek(value);
           }}
           onPointerUp={() => {
             draggingScrubRef.current = false;
+            keyboardScrubReadoutRef.current = null;
             setScrub(null);
           }}
           onPointerCancel={() => {
             draggingScrubRef.current = false;
+            keyboardScrubReadoutRef.current = null;
             setScrub(null);
           }}
           onBlur={() => {
             draggingScrubRef.current = false;
+            keyboardScrubReadoutRef.current = null;
             setScrub(null);
           }}
           aria-label="Scene time"

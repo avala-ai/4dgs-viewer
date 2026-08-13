@@ -549,13 +549,14 @@ async function chunkDisagreement(entry, source, size) {
  * Each chunk merges its own bands, so the only thing left to do is lay the per-gaussian
  * blocks end to end in the same order `assembleGaussians` lays out everything else.
  */
-function concatSh(chunks) {
+export function concatSh(chunks) {
+  const nonempty = chunks.filter((chunk) => chunk.gaussians.count > 0);
   const withBands = chunks.filter(
-    (chunk) => chunk.sh !== null && chunk.sh.degree > 0,
+    (chunk) => chunk.gaussians.count > 0 && chunk.sh !== null && chunk.sh.degree > 0,
   );
   if (withBands.length === 0) return null;
   const degrees = new Set(withBands.map((chunk) => chunk.sh.degree));
-  if (withBands.length !== chunks.length || degrees.size > 1) {
+  if (withBands.length !== nonempty.length || degrees.size > 1) {
     throw new MalformedFile(
       `chunks covering this instant disagree on SH degree: ${[...degrees].join(", ")}`,
     );
@@ -567,6 +568,7 @@ function concatSh(chunks) {
   const values = new Uint8Array(count * width);
   let at = 0;
   for (const chunk of chunks) {
+    if (chunk.gaussians.count === 0) continue;
     values.set(chunk.sh.values, at * width);
     at += chunk.gaussians.count;
   }

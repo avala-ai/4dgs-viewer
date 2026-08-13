@@ -387,6 +387,37 @@ describe("the viewer in a browser", { skip: available ? false : "no Chrome found
     await page.close();
   });
 
+  it("accumulates repeated keyboard-style scrubs before the readout catches up", async () => {
+    const page = await viewer();
+    await page.evaluate(pickFile, `${site.base}/corpus/${VALID}`);
+    await page.waitFor(opened);
+
+    // Freeze the animation loop after the scene has opened, leaving the throttled readout
+    // deliberately stale. `stepUp` plus `change` is the range input's ArrowRight default
+    // action and React event; yielding lets each controlled-value render complete.
+    await page.evaluate(() => {
+      globalThis.requestAnimationFrame = () => 0;
+      return true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const values = await page.evaluate(async () => {
+      const scrub = document.querySelector('input[type="range"]');
+      const seen = [];
+      for (let i = 0; i < 4; i++) {
+        scrub.stepUp();
+        scrub.dispatchEvent(new Event("change", { bubbles: true }));
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        seen.push(Number(scrub.value));
+      }
+      return seen;
+    });
+    assert.ok(
+      values.every((value, index) => index === 0 || value > values[index - 1]),
+      `keyboard scrubs did not accumulate: ${values.join(", ")}`,
+    );
+    await page.close();
+  });
+
   it("draws the same picture when the device forces a narrower texture", async () => {
     const wide = await viewer(PRESERVE_BUFFER);
     await wide.evaluate(pickFile, `${site.base}/corpus/${VALID}`);
@@ -429,6 +460,8 @@ describe("the viewer in a browser", { skip: available ? false : "no Chrome found
     assert.equal(lost.refusalTitle, "ViewerCapabilityError");
     assert.match(lost.refusalBody, /WebGL2 context was lost/);
     assert.equal(lost.fileDisabled, true);
+    assert.equal(lost.playDisabled, true);
+    assert.equal(lost.scrubDisabled, true);
 
     await page.evaluate(() => window.__restoreWebglForTest());
     await page.waitFor(opened, { what: "the rebuilt renderer" });

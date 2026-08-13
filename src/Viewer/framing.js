@@ -2,6 +2,9 @@ import { boundsOf } from "./camera.js";
 
 /** Times to try when looking for a non-empty instant to frame the camera on. */
 const FRAMING_PROBES = [0, 0.25, 0.5, 0.75, 0.999];
+/** Optional probes may improve the landing camera, but may not hold an open forever. */
+const FRAMING_PROBE_TIMEOUT_MS = 1500;
+const PROBE_TIMED_OUT = Symbol("framing probe timed out");
 
 /**
  * Put the camera round the scene, using the first instant that has anything in it.
@@ -16,6 +19,7 @@ export async function frameCamera(
   camera,
   isCurrent,
   refusalName = (failure) => failure?.name ?? "Error",
+  probeTimeoutMs = FRAMING_PROBE_TIMEOUT_MS,
 ) {
   // The instant the visitor lands on. A refusal here is the file's answer to "can you open
   // this", and is allowed to propagate.
@@ -33,7 +37,14 @@ export async function frameCamera(
     if (fraction === 0 || !(playable.duration > 0)) continue;
     const t = Math.min(playable.duration * fraction, lastInstant(playable.duration));
     try {
-      const frame = await playable.frameAt(t);
+      const frame = await within(playable.frameAt(t), probeTimeoutMs);
+      if (frame === PROBE_TIMED_OUT) {
+        warnings.push(
+          `t = ${t} camera framing probe did not answer within ${probeTimeoutMs} ms; ` +
+            "the scene opened using its Header bounds",
+        );
+        break;
+      }
       bounds ??= boundsOf(frame.centers, frame.count);
     } catch (failure) {
       // Not a refusal of the file: everything before this instant still decodes, and an
@@ -50,6 +61,21 @@ export async function frameCamera(
     framing === null ? 1 : framing.radius,
   );
   return warnings;
+}
+
+/** Bound an optional operation without leaving its eventual rejection unobserved. */
+async function within(operation, timeoutMs) {
+  let timer;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(PROBE_TIMED_OUT), timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /** A scene-wide framing fallback for sparse visibility that fixed time probes can miss. */

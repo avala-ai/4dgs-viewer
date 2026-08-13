@@ -24,7 +24,7 @@ import {
   reconstructKeyframeDelta as reconstructSdkKeyframeDelta,
 } from "@4dgs/core";
 
-import { ViewerLimitError, openScene } from "../src/Viewer/openScene.js";
+import { ViewerLimitError, concatSh, openScene } from "../src/Viewer/openScene.js";
 import { frameCamera } from "../src/Viewer/framing.js";
 import { reconstructKeyframeDelta } from "../src/Viewer/keyframeDelta.js";
 import {
@@ -246,6 +246,46 @@ describe("camera framing survives asynchronous and sparse opens", () => {
       () => true,
     );
     assert.deepEqual(probes, [0]);
+  });
+
+  it("bounds optional probes that never settle and opens with Header bounds", async () => {
+    const probes = [];
+    const framed = [];
+    const warnings = await frameCamera(
+      {
+        duration: 1,
+        header: { aabb: [10, 20, 30, 14, 26, 38] },
+        frameAt: (t) => {
+          probes.push(t);
+          return t === 0 ? Promise.resolve(empty) : new Promise(() => {});
+        },
+      },
+      () => ({ setFrame() {} }),
+      { frame: (center, radius) => framed.push({ center, radius }) },
+      () => true,
+      undefined,
+      10,
+    );
+    assert.deepEqual(probes, [0, 0.25]);
+    assert.deepEqual(framed[0].center, [12, 23, 34]);
+    assert.equal(framed[0].radius, Math.hypot(4, 6, 8) / 2);
+    assert.match(warnings[0], /did not answer within 10 ms/);
+  });
+});
+
+describe("spherical harmonics follow the nonempty chunks at an instant", () => {
+  it("does not require an empty overlapping chunk to carry an SH block", () => {
+    const values = Uint8Array.from({ length: 9 }, (_, index) => index + 1);
+    const merged = concatSh([
+      {
+        gaussians: { count: 1 },
+        sh: { degree: 1, coefficients: 3, values, bands: [1] },
+      },
+      { gaussians: { count: 0 }, sh: null },
+    ]);
+    assert.equal(merged.degree, 1);
+    assert.equal(merged.count, 1);
+    assert.deepEqual(merged.values, values);
   });
 });
 
