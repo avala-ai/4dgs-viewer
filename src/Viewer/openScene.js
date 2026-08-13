@@ -35,7 +35,6 @@ import {
   decodeKeyframeDeltaStreamed,
   decodeScene,
   parseHeader,
-  readRecord,
   stateAtWithObjects,
 } from "@4dgs/core";
 
@@ -701,7 +700,7 @@ export function concatSh(chunks) {
  * the whole resource is read before anything is composed. The page says so.
  */
 async function openKeyframeDelta(source, size) {
-  if (await hasTerminalFooter(source, size)) {
+  if (await claimsTerminalFooter(source, size)) {
     return indexedKeyframePlayable(
       await KeyframeDeltaIndexedDecoder.open(source),
       source,
@@ -804,8 +803,15 @@ function indexedKeyframePlayable(decoder, source) {
   };
 }
 
-/** Whether the resource ends in one correctly framed fixed Footer and trailing magic. */
-async function hasTerminalFooter(source, size) {
+/**
+ * Whether the tail claims to be a complete file rather than coincidental payload magic.
+ *
+ * Either fixed Footer field is enough to make the claim. The indexed decoder then owns
+ * the full structural verdict: an intact opcode with a bad length, or the fixed length
+ * under a bad opcode, is malformed rather than a truncated prefix. Magic at the end of
+ * unrelated record content has neither field and remains eligible for prefix recovery.
+ */
+async function claimsTerminalFooter(source, size) {
   if (size < FOOTER_TAIL_BYTES) return false;
   const offset = size - FOOTER_TAIL_BYTES;
   const tail = await source.read(BigInt(offset), BigInt(FOOTER_TAIL_BYTES));
@@ -813,13 +819,17 @@ async function hasTerminalFooter(source, size) {
     return false;
   }
   try {
-    const footer = readRecord(new Cursor(tail, 0, offset));
+    const cursor = new Cursor(tail, 0, offset);
+    const opcode = cursor.u8();
+    const contentLength = cursor.u64();
     return (
-      footer.opcode === Opcode.Footer &&
-      footer.length === FOOTER_TAIL_BYTES - MAGIC.length
+      opcode === Opcode.Footer ||
+      contentLength === FOOTER_TAIL_BYTES - RECORD_HEADER_BYTES - MAGIC.length
     );
   } catch {
-    return false;
+    // A Footer opcode whose length is not even representable is still a completeness
+    // claim, and the indexed decoder will name that malformed u64 precisely.
+    return tail[0] === Opcode.Footer;
   }
 }
 

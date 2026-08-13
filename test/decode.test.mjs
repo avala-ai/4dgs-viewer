@@ -50,6 +50,7 @@ import {
   appendPrivateRecordEndingMagic,
   cutAfterChunk,
   withBadSummaryCrc,
+  withCorruptTerminalFooter,
   withDuplicateIndexOffset,
   withHeaderDuration,
   withHeaderShDegree,
@@ -713,6 +714,19 @@ describe("§11.10: a keyframe-delta timeline ends where its chunks do", () => {
     );
     assert.ok((await playable.frameAt(0)).count > 0);
   });
+
+  for (const field of ["opcode", "length"]) {
+    it(`refuses a complete file whose terminal Footer ${field} is corrupt`, async () => {
+      const bytes = withCorruptTerminalFooter(variant(source).bytes, field);
+      await assert.rejects(
+        () => openScene(new BytesReadable(bytes)),
+        (error) =>
+          error instanceof MalformedFile &&
+          error.message.includes("fixed tail") &&
+          error.message.includes("Footer"),
+      );
+    });
+  }
 
   it("storage order is not time order: coverage comes from the largest t1", async () => {
     const whole = variant(source);

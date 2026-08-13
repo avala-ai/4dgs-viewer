@@ -409,3 +409,21 @@ export function appendPrivateRecordEndingMagic(bytes) {
   framed.set(content, RECORD_HEADER_BYTES);
   return join([bytes, framed]);
 }
+
+/** Corrupt one of the two fields that identify the fixed terminal Footer record. */
+export function withCorruptTerminalFooter(bytes, field) {
+  const out = bytes.slice();
+  const footer = out.length - (RECORD_HEADER_BYTES + 20 + MAGIC.length);
+  if (field === "opcode") {
+    out[footer] = 0x80;
+  } else if (field === "length") {
+    new DataView(out.buffer, out.byteOffset, out.byteLength).setBigUint64(
+      footer + 1,
+      19n,
+      true,
+    );
+  } else {
+    throw new Error(`unknown Footer field ${field}`);
+  }
+  return out;
+}
