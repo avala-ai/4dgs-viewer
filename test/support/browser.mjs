@@ -140,9 +140,12 @@ function serveRange(file, request, response) {
 }
 
 /** Launch Chrome and connect to its browser-level DevTools endpoint. */
-export async function launchChrome(executable) {
+export async function launchChrome(
+  executable,
+  { endpointTimeoutMs = 30000, spawnImpl = spawn } = {},
+) {
   const profile = await mkdtemp(path.join(tmpdir(), "4dgs-viewer-test-"));
-  const child = spawn(
+  const child = spawnImpl(
     executable,
     [
       "--headless=new",
@@ -160,28 +163,32 @@ export async function launchChrome(executable) {
     { stdio: ["ignore", "pipe", "pipe"] },
   );
 
-  const endpoint = await new Promise((resolve, reject) => {
-    let buffer = "";
-    const timer = setTimeout(
-      () => reject(new Error(`Chrome did not report a port:\n${buffer}`)),
-      30000,
+  const cleanup = async () => {
+    child.kill("SIGKILL");
+    await rm(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }).catch(
+      () => {},
     );
-    child.stderr.on("data", (chunk) => {
-      buffer += chunk;
-      const found = /ws:\/\/[^\s]+/.exec(buffer);
-      if (found !== null) {
-        clearTimeout(timer);
-        resolve(found[0]);
-      }
-    });
-    child.on("exit", (code) => reject(new Error(`Chrome exited with ${code}:\n${buffer}`)));
-  });
+  };
 
-  const socket = new WebSocket(endpoint);
-  await new Promise((resolve, reject) => {
-    socket.addEventListener("open", resolve, { once: true });
-    socket.addEventListener("error", reject, { once: true });
-  });
+  let endpoint;
+  try {
+    endpoint = await chromeEndpoint(child, endpointTimeoutMs);
+  } catch (failure) {
+    await cleanup();
+    throw failure;
+  }
+
+  let socket;
+  try {
+    socket = new WebSocket(endpoint);
+    await new Promise((resolve, reject) => {
+      socket.addEventListener("open", resolve, { once: true });
+      socket.addEventListener("error", reject, { once: true });
+    });
+  } catch (failure) {
+    await cleanup();
+    throw failure;
+  }
 
   let nextId = 1;
   const pending = new Map();
@@ -217,14 +224,38 @@ export async function launchChrome(executable) {
       } catch {
         /* already gone */
       }
-      child.kill("SIGKILL");
-      // Chrome is still letting go of its profile; failing to delete a temporary directory
-      // is not a test result.
-      await rm(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }).catch(
-        () => {},
-      );
+      await cleanup();
     },
   };
+}
+
+/** Wait for Chrome's DevTools endpoint, removing listeners whichever outcome wins. */
+function chromeEndpoint(child, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    let buffer = "";
+    let settled = false;
+    const finish = (operation, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.stderr.off("data", onData);
+      child.off("exit", onExit);
+      operation(value);
+    };
+    const onData = (chunk) => {
+      buffer += chunk;
+      const found = /ws:\/\/[^\s]+/.exec(buffer);
+      if (found !== null) finish(resolve, found[0]);
+    };
+    const onExit = (code) =>
+      finish(reject, new Error(`Chrome exited with ${code}:\n${buffer}`));
+    const timer = setTimeout(
+      () => finish(reject, new Error(`Chrome did not report a port:\n${buffer}`)),
+      timeoutMs,
+    );
+    child.stderr.on("data", onData);
+    child.on("exit", onExit);
+  });
 }
 
 function makePage(send, sessionId, targetId) {

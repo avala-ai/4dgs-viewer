@@ -10,6 +10,9 @@
  */
 
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import { existsSync } from "node:fs";
+import { PassThrough } from "node:stream";
 import { after, before, describe, it } from "node:test";
 
 import { findChrome, launchChrome, requireBuiltSite, serveSite } from "./support/browser.mjs";
@@ -21,6 +24,7 @@ if (available) requireBuiltSite();
 const VALID = "TenWindows-UseChunkIndex-UseCrc.4dgs";
 const MULTI_CHUNK = "TenWindows-UseChunkIndex-UseChunks-UseCrc.4dgs";
 const INVALID = "invalid/UnknownTemporalModel.4dgs";
+const ONE = "OneGaussian-UseChunkIndex-UseCrc.4dgs";
 
 /** Read the page's whole visible state in one round trip. */
 function readState() {
@@ -215,6 +219,23 @@ const KEEP_CONTEXT_LOST = `
   })();
 `;
 
+/** Make URL metadata discovery wait until its AbortSignal is cancelled. */
+const HANG_REMOTE_SIZE = `
+  (() => {
+    const real = globalThis.fetch.bind(globalThis);
+    globalThis.__viewerSizeAborts = 0;
+    globalThis.fetch = function (input, init = {}) {
+      if (init.method !== "HEAD") return real(input, init);
+      return new Promise((resolve, reject) => {
+        init.signal.addEventListener("abort", () => {
+          globalThis.__viewerSizeAborts += 1;
+          reject(init.signal.reason);
+        }, { once: true });
+      });
+    };
+  })();
+`;
+
 /** Let a test turn otherwise valid URL range reads into transport failures. */
 const FAIL_RANGES_ON_DEMAND = `
   (() => {
@@ -362,6 +383,32 @@ describe("the viewer in a browser", { skip: available ? false : "no Chrome found
   };
   const refused = () => document.querySelector("h3") !== null;
 
+  it("kills Chrome and removes its profile when endpoint discovery times out", async () => {
+    const child = new EventEmitter();
+    child.stderr = new PassThrough();
+    let killedWith = null;
+    let profile = null;
+    child.kill = (signal) => {
+      killedWith = signal;
+      return true;
+    };
+    await assert.rejects(
+      () =>
+        launchChrome("unused", {
+          endpointTimeoutMs: 10,
+          spawnImpl(_executable, args) {
+            profile = args
+              .find((argument) => argument.startsWith("--user-data-dir="))
+              .slice("--user-data-dir=".length);
+            return child;
+          },
+        }),
+      /did not report a port/,
+    );
+    assert.equal(killedWith, "SIGKILL");
+    assert.equal(existsSync(profile), false, `temporary profile survived at ${profile}`);
+  });
+
   it("opens a corpus file and shows the file's own facts", async () => {
     const page = await viewer();
     await page.waitFor(
@@ -490,6 +537,47 @@ describe("the viewer in a browser", { skip: available ? false : "no Chrome found
       seen.size > 1,
       `the live count never changed (${[...seen].join(", ")}): the replacement is not being framed`,
     );
+    await page.close();
+  });
+
+  it("cancels a remote size probe that never settles", async () => {
+    const page = await viewer(HANG_REMOTE_SIZE, SHORTEN_FRAME_TIMEOUT);
+    await page.evaluate(() => {
+      globalThis.__shortenViewerFrameTimeout = true;
+      return true;
+    });
+    await page.evaluate(openUrl, `${site.base}/range/${VALID}`);
+    await page.waitFor(refused, { what: "the bounded remote-opening refusal" });
+    const state = await page.evaluate(readState);
+    assert.equal(state.refusalTitle, "ViewerLimitError");
+    assert.match(state.refusalBody, /opening did not settle within 15 seconds/);
+    assert.equal(await page.evaluate(() => globalThis.__viewerSizeAborts), 1);
+    await page.close();
+  });
+
+  it("publishes replacement facts with its landing-frame readout", async () => {
+    const page = await viewer();
+    await page.evaluate(pickFile, `${site.base}/corpus/${MULTI_CHUNK}`);
+    await page.waitFor(opened);
+    await page.evaluate(seekFraction, 0.75);
+    await page.waitFor(
+      () => Number(document.querySelector('input[type="range"]')?.value) > 0,
+      { what: "the first scene at a nonzero instant" },
+    );
+    // Stop the animation loop after its already queued callback. The replacement open
+    // must initialize facts itself rather than depending on a later throttled tick.
+    await page.evaluate(() => {
+      globalThis.requestAnimationFrame = () => 0;
+      return true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    await page.evaluate(pickFile, `${site.base}/corpus/${ONE}`);
+    await page.waitFor(opened, { what: "the replacement one-gaussian scene" });
+    const state = await page.evaluate(readState);
+    assert.equal(state.rows["Gaussians in the file"], "1");
+    assert.equal(state.rows["Live at this instant"], "1");
+    assert.equal(state.scrubValue, 0);
+    assert.equal(state.clock?.split(" / ")[0], "0.000");
     await page.close();
   });
 

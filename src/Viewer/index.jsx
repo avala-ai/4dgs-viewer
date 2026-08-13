@@ -29,6 +29,8 @@ import styles from "./styles.module.css";
 
 /** How often the readouts under the canvas are allowed to re-render, in milliseconds. */
 const READOUT_INTERVAL = 100;
+/** Longest remote metadata/index opening may retain the page's busy state. */
+const OPENING_TIMEOUT_MS = 15_000;
 
 class ViewerCapabilityError extends Error {
   constructor(message) {
@@ -60,6 +62,8 @@ export default function Viewer() {
   const fileFailureRef = useRef(null);
   /** The last open attempted during a recoverable context loss. */
   const pendingOpenRef = useRef(null);
+  /** Cancels every fetch owned by the current URL resource when it is replaced. */
+  const transportAbortRef = useRef(null);
   /** Revoke the render loop's current frame request after an explicit seek. */
   const frameRequestRef = useRef(() => {});
 
@@ -226,7 +230,11 @@ export default function Viewer() {
       const pendingOpen = pendingOpenRef.current;
       pendingOpenRef.current = null;
       if (pendingOpen !== null) {
-        open(pendingOpen.readable, pendingOpen.label);
+        open(
+          pendingOpen.readable,
+          pendingOpen.label,
+          pendingOpen.transportAbort,
+        );
         return;
       }
 
@@ -344,6 +352,8 @@ export default function Viewer() {
 
     return () => {
       running = false;
+      transportAbortRef.current?.abort();
+      transportAbortRef.current = null;
       invalidateFrame();
       frameRequestRef.current = () => {};
       canvas.removeEventListener("wheel", wheel);
@@ -363,7 +373,7 @@ export default function Viewer() {
 
   // --- opening a file ------------------------------------------------------
 
-  const open = useCallback(async (readable, label) => {
+  const open = useCallback(async (readable, label, transportAbort = null) => {
     // Nothing to open a file into. Restate why rather than replacing it with a refusal
     // about the file, which is not the thing that is wrong.
     if (setupFailureRef.current !== null) {
@@ -371,12 +381,19 @@ export default function Viewer() {
         // A context restoration is already in flight. Keep only the most recent choice;
         // once GPU resources have been rebuilt it is opened through the ordinary serial
         // path, so a startup loss cannot silently eat the visitor's first file.
-        pendingOpenRef.current = { readable, label };
+        pendingOpenRef.current?.transportAbort?.abort();
+        pendingOpenRef.current = { readable, label, transportAbort };
+      } else {
+        transportAbort?.abort();
       }
       setError(setupFailureRef.current);
       return;
     }
     pendingOpenRef.current = null;
+    // A replacement owns the transport now. Native fetch observes this signal, so a hung
+    // size probe or frame range from the old URL cannot accumulate behind later retries.
+    transportAbortRef.current?.abort();
+    transportAbortRef.current = transportAbort;
     const playback = playbackRef.current;
     // A URL over a slow link and a large local file both take long enough that a visitor
     // can start a second open before the first returns. Every effect below is guarded by
@@ -402,7 +419,11 @@ export default function Viewer() {
     // reading that some of the new file came through, which is exactly false.
     rendererRef.current?.clear();
     try {
-      const playable = await openScene(readable);
+      const playable = await openingWithin(
+        openScene(readable),
+        transportAbort,
+        OPENING_TIMEOUT_MS,
+      );
       if (!current()) return;
       // Framing also probes a handful of instants. One that will not decode is worth
       // saying now rather than three seconds into playback, so its refusal joins the notes.
@@ -419,6 +440,13 @@ export default function Viewer() {
       playback.playable = playable;
       playback.time = 0;
       playback.rendered = 0;
+      setScrub(null);
+      setReadout({
+        time: 0,
+        count: rendererRef.current?.count ?? 0,
+        intervals: playable.intervalsAt(0),
+        transfer: playable.transfer(),
+      });
       setScene(playable);
     } catch (failure) {
       if (current()) {
@@ -444,7 +472,12 @@ export default function Viewer() {
   const openUrl = useCallback(() => {
     const trimmed = url.trim();
     if (trimmed === "") return;
-    open(new HttpRangeReadable(trimmed), `${trimmed} — read by byte range from your browser`);
+    const transportAbort = new AbortController();
+    open(
+      new HttpRangeReadable(trimmed, { init: { signal: transportAbort.signal } }),
+      `${trimmed} — read by byte range from your browser`,
+      transportAbort,
+    );
   }, [open, url]);
 
   // --- pointer camera ------------------------------------------------------
@@ -674,6 +707,27 @@ export default function Viewer() {
       {scene !== null && <Facts scene={scene} readout={readout} />}
     </div>
   );
+}
+
+/** Bound remote opening and abort its underlying fetch before publishing the diagnosis. */
+async function openingWithin(operation, transportAbort, timeoutMs) {
+  if (transportAbort === null) return await operation;
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const failure = new ViewerLimitError(
+        `remote scene opening did not settle within ${timeoutMs / 1000} seconds; ` +
+          "the request was cancelled instead of leaving this page busy indefinitely",
+      );
+      transportAbort.abort(failure);
+      reject(failure);
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([operation, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**
