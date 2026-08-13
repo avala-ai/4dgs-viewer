@@ -100,13 +100,42 @@ export default function Viewer() {
     let previous = performance.now();
     let lastReadout = 0;
     /**
-     * The open serial an in-flight `frameAt` belongs to, or null when nothing is in flight.
+     * The current frame request, if any. Both parts of its identity matter: `serial`
+     * changes when the visitor opens another resource, while `generation` changes when
+     * WebGL loses every resource belonging to the renderer a request was started for.
      *
-     * Not a bare boolean: a range request against the file the visitor has moved on from
-     * may never settle, and a flag it shares would keep the replacement scene from ever
-     * asking for a frame. An obsolete request stops counting the moment the serial moves.
+     * The token is replaced, rather than shared as a boolean, so an obsolete request may
+     * remain unresolved forever without blocking a newer file or restored renderer. It
+     * also means a late obsolete settlement cannot clear the newer request's guard.
      */
-    let pendingSerial = null;
+    let frameGeneration = 0;
+    let pendingFrame = null;
+
+    const beginFrame = (playback, playable, wanted, targetRenderer) => {
+      const token = {
+        serial: playback.serial,
+        generation: frameGeneration,
+        playable,
+        wanted,
+        renderer: targetRenderer,
+      };
+      pendingFrame = token;
+      return token;
+    };
+    const releaseFrame = (token) => {
+      if (pendingFrame === token) pendingFrame = null;
+    };
+    const frameIsCurrent = (token) => {
+      const playback = playbackRef.current;
+      return (
+        running &&
+        !contextIsLost &&
+        token.generation === frameGeneration &&
+        playback.serial === token.serial &&
+        playback.playable === token.playable &&
+        renderer === token.renderer
+      );
+    };
 
     const contextLost = (event) => {
       // Prevent the default so the platform is allowed to restore the context. Until then,
@@ -119,6 +148,11 @@ export default function Viewer() {
       setupFailureRef.current = failure;
       const playback = playbackRef.current;
       playback.playing = false;
+      playback.rendered = undefined;
+      // A read started for the lost renderer no longer owns the pending slot. It may
+      // never settle, and even if it does its generation must keep it off the new GPU.
+      frameGeneration += 1;
+      pendingFrame = null;
       renderer.clear();
       setPlaying(false);
       setSetupFailed(true);
@@ -165,18 +199,26 @@ export default function Viewer() {
       // diagnosis, not evidence that rebuilding WebGL failed.
       const playback = playbackRef.current;
       const playable = playback.playable;
-      const serial = playback.serial;
       if (playable !== null) {
+        const wanted = playback.time;
+        const targetRenderer = renderer;
+        const token = beginFrame(playback, playable, wanted, targetRenderer);
         try {
-          const frame = await playable.frameAt(playback.time);
-          if (running && playbackRef.current.serial === serial && !contextIsLost) {
-            rendererRef.current?.setFrame(frame);
-            playbackRef.current.rendered = playback.time;
-          }
+          const frame = await playable.frameAt(wanted);
+          releaseFrame(token);
+          const current = playbackRef.current;
+          // The instant is part of the result's identity. If the visitor sought while
+          // this range read was pending, leave `rendered` invalid so the loop requests
+          // that newer instant instead of labelling this older frame with the new time.
+          if (!frameIsCurrent(token) || current.time !== wanted) return;
+          targetRenderer.setFrame(frame);
+          current.rendered = wanted;
         } catch (failure) {
-          if (!running || playbackRef.current.serial !== serial) return;
-          playbackRef.current.playable = null;
-          rendererRef.current?.clear();
+          releaseFrame(token);
+          const current = playbackRef.current;
+          if (!frameIsCurrent(token) || current.time !== wanted) return;
+          current.playable = null;
+          targetRenderer.clear();
           setPlaying(false);
           setDecodeFailed(true);
           setError(failure);
@@ -209,25 +251,29 @@ export default function Viewer() {
             }
           }
         }
-        // One instant in flight at a time, per open. A seek that has not come back yet
-        // simply keeps the previous frame on screen for another animation frame.
-        if (pendingSerial !== playback.serial && playback.rendered !== playback.time) {
+        // One instant in flight at a time for the current open and renderer generation.
+        // A request owned by an older open or a lost context does not occupy this slot.
+        const pendingCurrent =
+          pendingFrame !== null &&
+          pendingFrame.serial === playback.serial &&
+          pendingFrame.generation === frameGeneration;
+        if (!pendingCurrent && playback.rendered !== playback.time) {
           const wanted = playback.time;
-          const serial = playback.serial;
-          pendingSerial = serial;
+          const targetRenderer = renderer;
+          const token = beginFrame(playback, playable, wanted, targetRenderer);
           playable
             .frameAt(wanted)
             .then((frame) => {
-              if (pendingSerial === serial) pendingSerial = null;
-              if (!running || playbackRef.current.serial !== serial) return;
+              releaseFrame(token);
+              if (!frameIsCurrent(token)) return;
               playbackRef.current.rendered = wanted;
-              renderer.setFrame(frame);
+              targetRenderer.setFrame(frame);
             })
             .catch((failure) => {
-              if (pendingSerial === serial) pendingSerial = null;
-              if (!running || playbackRef.current.serial !== serial) return;
+              releaseFrame(token);
+              if (!frameIsCurrent(token)) return;
               playbackRef.current.playable = null;
-              renderer.clear();
+              targetRenderer.clear();
               setPlaying(false);
               setDecodeFailed(true);
               setError(failure);
@@ -252,6 +298,8 @@ export default function Viewer() {
 
     return () => {
       running = false;
+      frameGeneration += 1;
+      pendingFrame = null;
       canvas.removeEventListener("webglcontextlost", contextLost);
       canvas.removeEventListener("webglcontextrestored", contextRestored);
       renderer.dispose();

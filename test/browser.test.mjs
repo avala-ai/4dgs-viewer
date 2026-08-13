@@ -143,6 +143,56 @@ const FAIL_RANGES_ON_DEMAND = `
   })();
 `;
 
+/** Let a test hold or permanently strand exactly one URL range read. */
+const CONTROL_NEXT_RANGE = `
+  (() => {
+    const real = globalThis.fetch.bind(globalThis);
+    globalThis.__nextViewerRange = "pass";
+    globalThis.__viewerRangeHeld = 0;
+    globalThis.__viewerRangeHung = 0;
+    globalThis.__releaseViewerRange = null;
+    globalThis.fetch = function (input, init) {
+      const range = new Headers(init && init.headers).get("range");
+      const mode = globalThis.__nextViewerRange;
+      if (range === null || mode === "pass") return real(input, init);
+      globalThis.__nextViewerRange = "pass";
+      if (mode === "hang") {
+        globalThis.__viewerRangeHung += 1;
+        return new Promise(() => {});
+      }
+      if (mode === "hold") {
+        globalThis.__viewerRangeHeld += 1;
+        return new Promise((resolve, reject) => {
+          globalThis.__releaseViewerRange = () => {
+            globalThis.__releaseViewerRange = null;
+            real(input, init).then(resolve, reject);
+          };
+        });
+      }
+      return real(input, init);
+    };
+  })();
+`;
+
+/** Seek to a fraction of the file's duration through the viewer's real control. */
+function seekFraction(fraction) {
+  const scrub = document.querySelector('input[type="range"]');
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
+  setter.call(scrub, String(Number(scrub.max) * fraction));
+  scrub.dispatchEvent(new Event("change", { bubbles: true }));
+  return true;
+}
+
+/** Lose WebGL2 and retain the extension's restore operation for the test. */
+function loseContext() {
+  const gl = document.querySelector("canvas").getContext("webgl2");
+  const extension = gl.getExtension("WEBGL_lose_context");
+  if (extension === null) throw new Error("WEBGL_lose_context is unavailable");
+  window.__restoreWebglForTest = () => extension.restoreContext();
+  extension.loseContext();
+  return true;
+}
+
 describe("the viewer in a browser", { skip: available ? false : "no Chrome found" }, () => {
   let chrome;
   let site;
@@ -372,14 +422,7 @@ describe("the viewer in a browser", { skip: available ? false : "no Chrome found
     const page = await viewer();
     await page.evaluate(pickFile, `${site.base}/corpus/${VALID}`);
     await page.waitFor(opened);
-    const canRestore = await page.evaluate(() => {
-      const gl = document.querySelector("canvas").getContext("webgl2");
-      const extension = gl.getExtension("WEBGL_lose_context");
-      if (extension === null) throw new Error("WEBGL_lose_context is unavailable");
-      window.__restoreWebglForTest = () => extension.restoreContext();
-      extension.loseContext();
-      return true;
-    });
+    const canRestore = await page.evaluate(loseContext);
     assert.equal(canRestore, true);
     await page.waitFor(refused, { what: "the WebGL context-loss refusal" });
     const lost = await page.evaluate(readState);
@@ -395,19 +438,95 @@ describe("the viewer in a browser", { skip: available ? false : "no Chrome found
     await page.close();
   });
 
+  it("releases a never-settling frame read when WebGL is restored", async () => {
+    const page = await viewer(CONTROL_NEXT_RANGE);
+    await page.evaluate(openUrl, `${site.base}/range/${MULTI_CHUNK}`);
+    await page.waitFor(opened, { what: "the URL-backed scene" });
+
+    // The first read of the 75% Chunk never settles. Context loss must invalidate both
+    // its publication rights and its pending slot; restoration's independent read can
+    // then recreate that instant on the new renderer.
+    await page.evaluate(() => {
+      globalThis.__nextViewerRange = "hang";
+      return true;
+    });
+    await page.evaluate(seekFraction, 0.75);
+    await page.waitFor(() => globalThis.__viewerRangeHung === 1, {
+      what: "the intentionally stranded frame range",
+    });
+    await page.evaluate(loseContext);
+    await page.waitFor(refused, { what: "the WebGL context-loss refusal" });
+    await page.evaluate(() => window.__restoreWebglForTest());
+    await page.waitFor(
+      () => {
+        const live = [...document.querySelectorAll("dt")].find(
+          (entry) => entry.textContent === "Live at this instant",
+        );
+        return Number(live?.nextElementSibling?.textContent.replace(/,/g, "")) === 24;
+      },
+      { what: "the restored 75% frame" },
+    );
+
+    // A second seek has to pass the old promise that is still unresolved. Before the
+    // generation guard, `pendingSerial` remained occupied forever and this stayed at 24.
+    await page.evaluate(seekFraction, 0.25);
+    await page.waitFor(
+      () => {
+        const live = [...document.querySelectorAll("dt")].find(
+          (entry) => entry.textContent === "Live at this instant",
+        );
+        return Number(live?.nextElementSibling?.textContent.replace(/,/g, "")) === 19;
+      },
+      { what: "a later seek past the still-stranded read" },
+    );
+    await page.close();
+  });
+
+  it("does not label a stale restoration frame with a newer seek", async () => {
+    const page = await viewer(CONTROL_NEXT_RANGE);
+    await page.evaluate(openUrl, `${site.base}/range/${MULTI_CHUNK}`);
+    await page.waitFor(opened, { what: "the URL-backed scene" });
+    await page.evaluate(loseContext);
+    await page.waitFor(refused, { what: "the WebGL context-loss refusal" });
+
+    // Restoration captures 75% (24 live gaussians), then blocks in its real range read.
+    // Seek to 25% (19 live) before releasing it. The 75% result is now stale: publishing
+    // it while setting `rendered` to the newer playback time would suppress the real seek.
+    await page.evaluate(() => {
+      globalThis.__nextViewerRange = "hold";
+      return true;
+    });
+    await page.evaluate(seekFraction, 0.75);
+    await page.evaluate(() => window.__restoreWebglForTest());
+    await page.waitFor(() => globalThis.__viewerRangeHeld === 1, {
+      what: "restoration waiting on the 75% frame range",
+    });
+    await page.evaluate(seekFraction, 0.25);
+    await page.evaluate(() => {
+      globalThis.__releaseViewerRange();
+      return true;
+    });
+    await page.waitFor(
+      () => {
+        const live = [...document.querySelectorAll("dt")].find(
+          (entry) => entry.textContent === "Live at this instant",
+        );
+        return Number(live?.nextElementSibling?.textContent.replace(/,/g, "")) === 19;
+      },
+      { what: "the frame for the seek made during restoration" },
+    );
+    const state = await page.evaluate(readState);
+    assert.equal(state.scrubValue, 5);
+    assert.equal(state.rows["Live at this instant"], "19");
+    await page.close();
+  });
+
   it("keeps a decode failure during restoration separate from renderer capability", async () => {
     const page = await viewer(FAIL_RANGES_ON_DEMAND);
     await page.evaluate(openUrl, `${site.base}/range/${MULTI_CHUNK}`);
     await page.waitFor(opened, { what: "the URL-backed scene" });
 
-    await page.evaluate(() => {
-      const gl = document.querySelector("canvas").getContext("webgl2");
-      const extension = gl.getExtension("WEBGL_lose_context");
-      if (extension === null) throw new Error("WEBGL_lose_context is unavailable");
-      window.__restoreWebglForTest = () => extension.restoreContext();
-      extension.loseContext();
-      return true;
-    });
+    await page.evaluate(loseContext);
     await page.waitFor(refused, { what: "the WebGL context-loss refusal" });
 
     // While the context is lost no animation frame can start this seek. Restoration must
