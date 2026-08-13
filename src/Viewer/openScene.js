@@ -219,14 +219,15 @@ async function openGaussianBirth(source, size) {
   return await streamedPlayable(scene, source, size, notes);
 }
 
-function cutoffOf(header) {
+/** The cutoff reconstruction actually applies when the Header carries the zero sentinel. */
+export function effectiveCutoff(header) {
   return header.cutoff > 0 ? header.cutoff : DEFAULT_CUTOFF;
 }
 
 /** Seeked reads: for each instant, only the chunks whose `[t0, t1)` contains it. */
 function indexedPlayable(decoder, source, notes) {
   const { header } = decoder;
-  const cutoff = cutoffOf(header);
+  const cutoff = effectiveCutoff(header);
   const chunks = new Map();
   let assembled = { key: null, set: null };
   let objectsPromise = null;
@@ -287,7 +288,7 @@ function indexedPlayable(decoder, source, notes) {
 
 /** Front to back: the whole scene decoded once, then reconstructed at each instant. */
 async function streamedPlayable(scene, source, size, notes) {
-  const cutoff = cutoffOf(scene.header);
+  const cutoff = effectiveCutoff(scene.header);
   const { gate, why } = await chunkGateOf(scene, source, size);
   if (gate === null) {
     notes.push(
@@ -603,7 +604,7 @@ async function openKeyframeDelta(source, size) {
   }
   const data = await source.read(0n, BigInt(size));
   const sequence = await decodeKeyframeDeltaStreamed(data);
-  const cutoff = cutoffOf(sequence.header);
+  const cutoff = effectiveCutoff(sequence.header);
   const notes = [
     "This resource is a truncated keyframe-delta prefix. Recovery composes the available " +
       "prefix whole because it has no Footer or Chunk Index to seek through.",

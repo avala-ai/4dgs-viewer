@@ -59,7 +59,7 @@ function pickFile(url) {
       transfer.items.add(file);
       input.files = transfer.files;
       input.dispatchEvent(new Event("change", { bubbles: true }));
-      return true;
+      return input.value;
     });
 }
 
@@ -236,7 +236,8 @@ describe("the viewer in a browser", { skip: available ? false : "no Chrome found
       },
       { what: "the renderer to survive browser startup" },
     );
-    await page.evaluate(pickFile, `${site.base}/corpus/${VALID}`);
+    const pickerValue = await page.evaluate(pickFile, `${site.base}/corpus/${VALID}`);
+    assert.equal(pickerValue, "", "the same path must be selectable again");
     await page.waitFor(opened, { what: "a scene with an enabled transport" });
     const state = await page.evaluate(readState);
     assert.equal(state.rows["Temporal model"], "gaussian-birth");
@@ -515,6 +516,35 @@ describe("the viewer in a browser", { skip: available ? false : "no Chrome found
     await page.close();
   });
 
+  it("releases a never-settling frame read when the visitor seeks again", async () => {
+    const page = await viewer(CONTROL_NEXT_RANGE);
+    await page.evaluate(openUrl, `${site.base}/range/${MULTI_CHUNK}`);
+    await page.waitFor(opened, { what: "the URL-backed scene" });
+
+    await page.evaluate(() => {
+      globalThis.__nextViewerRange = "hang";
+      return true;
+    });
+    await page.evaluate(seekFraction, 0.75);
+    await page.waitFor(() => globalThis.__viewerRangeHung === 1, {
+      what: "the intentionally stranded frame range",
+    });
+
+    // No new file and no context loss changes the playback serial here. The explicit
+    // second seek itself must revoke the old request and fetch its own Chunk.
+    await page.evaluate(seekFraction, 0.25);
+    await page.waitFor(
+      () => {
+        const live = [...document.querySelectorAll("dt")].find(
+          (entry) => entry.textContent === "Live at this instant",
+        );
+        return Number(live?.nextElementSibling?.textContent.replace(/,/g, "")) === 19;
+      },
+      { what: "a second seek past the still-stranded read" },
+    );
+    await page.close();
+  });
+
   it("does not label a stale restoration frame with a newer seek", async () => {
     const page = await viewer(CONTROL_NEXT_RANGE);
     await page.evaluate(openUrl, `${site.base}/range/${MULTI_CHUNK}`);
@@ -587,6 +617,30 @@ describe("the viewer in a browser", { skip: available ? false : "no Chrome found
     assert.match(state.refusalBody, /answered 503/);
     assert.equal(state.fileDisabled, false, "a file failure must not disable future opens");
     assert.equal(state.playDisabled, true, "the failed scene itself is retired");
+    await page.close();
+  });
+
+  it("restores the prior file refusal after WebGL recovers", async () => {
+    const page = await viewer();
+    await page.evaluate(pickFile, `${site.base}/corpus/${INVALID}`);
+    await page.waitFor(refused, { what: "the file refusal" });
+    const before = await page.evaluate(readState);
+    assert.equal(before.refusalTitle, "UnsupportedCodec");
+
+    await page.evaluate(loseContext);
+    await page.waitFor(
+      () => document.querySelector("h3")?.textContent === "ViewerCapabilityError",
+      { what: "the temporary WebGL refusal" },
+    );
+    await page.evaluate(() => window.__restoreWebglForTest());
+    await page.waitFor(
+      () => document.querySelector("h3")?.textContent === "UnsupportedCodec",
+      { what: "the original file refusal after restoration" },
+    );
+    const after = await page.evaluate(readState);
+    assert.equal(after.refusalBody, before.refusalBody);
+    assert.equal(after.fileDisabled, false);
+    assert.equal(after.playDisabled, true);
     await page.close();
   });
 });

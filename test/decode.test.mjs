@@ -15,6 +15,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import {
+  DEFAULT_CUTOFF,
   FourdgsError,
   MAGIC,
   MalformedFile,
@@ -24,7 +25,12 @@ import {
   reconstructKeyframeDelta as reconstructSdkKeyframeDelta,
 } from "@4dgs/core";
 
-import { ViewerLimitError, concatSh, openScene } from "../src/Viewer/openScene.js";
+import {
+  ViewerLimitError,
+  concatSh,
+  effectiveCutoff,
+  openScene,
+} from "../src/Viewer/openScene.js";
 import { frameCamera } from "../src/Viewer/framing.js";
 import { reconstructKeyframeDelta } from "../src/Viewer/keyframeDelta.js";
 import {
@@ -65,6 +71,13 @@ const INVALID = variants(FAMILIES.invalid);
 const hasChunkIndex = (variant) =>
   variant.name.includes("UseChunkIndex") &&
   variant.expected.chunkIntervals.length > 0;
+
+describe("Header defaults shown by the viewer", () => {
+  it("reports the effective marginal cutoff, including the zero sentinel", () => {
+    assert.equal(effectiveCutoff({ cutoff: 0 }), DEFAULT_CUTOFF);
+    assert.equal(effectiveCutoff({ cutoff: 0.125 }), 0.125);
+  });
+});
 
 describe("the corpus decodes to the same scene on both read paths", () => {
   // Guards against a corpus, or a viewer, in which nothing ever reaches one of the paths.

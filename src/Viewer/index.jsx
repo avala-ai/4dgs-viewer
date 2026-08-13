@@ -18,7 +18,7 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 
 import { OrbitCamera } from "./camera.js";
 import { frameCamera, lastInstant } from "./framing.js";
-import { ViewerLimitError, openScene } from "./openScene.js";
+import { ViewerLimitError, effectiveCutoff, openScene } from "./openScene.js";
 import { SplatRenderer } from "./renderer.js";
 import styles from "./styles.module.css";
 
@@ -51,8 +51,12 @@ export default function Viewer() {
    * through a ref as well as through state because `open` is created once and must see it.
    */
   const setupFailureRef = useRef(null);
+  /** The file or range refusal hidden temporarily while WebGL reports a capability error. */
+  const fileFailureRef = useRef(null);
   /** The last open attempted during a recoverable context loss. */
   const pendingOpenRef = useRef(null);
+  /** Revoke the render loop's current frame request after an explicit seek. */
+  const frameRequestRef = useRef(() => {});
 
   const [source, setSource] = useState(null);
   const [scene, setScene] = useState(null);
@@ -113,6 +117,12 @@ export default function Viewer() {
     let frameGeneration = 0;
     let pendingFrame = null;
 
+    const invalidateFrame = () => {
+      frameGeneration += 1;
+      pendingFrame = null;
+    };
+    frameRequestRef.current = invalidateFrame;
+
     const beginFrame = (playback, playable, wanted, targetRenderer) => {
       const token = {
         serial: playback.serial,
@@ -153,8 +163,7 @@ export default function Viewer() {
       playback.rendered = undefined;
       // A read started for the lost renderer no longer owns the pending slot. It may
       // never settle, and even if it does its generation must keep it off the new GPU.
-      frameGeneration += 1;
-      pendingFrame = null;
+      invalidateFrame();
       renderer.clear();
       setPlaying(false);
       setSetupFailed(true);
@@ -178,7 +187,7 @@ export default function Viewer() {
         contextIsLost = false;
         setupFailureRef.current = null;
         setSetupFailed(false);
-        setError(null);
+        setError(fileFailureRef.current);
       } catch (failure) {
         const wrapped = new ViewerCapabilityError(
           `the WebGL2 context was restored but the renderer could not be rebuilt: ${failure.message}`,
@@ -223,6 +232,7 @@ export default function Viewer() {
           targetRenderer.clear();
           setPlaying(false);
           setDecodeFailed(true);
+          fileFailureRef.current = failure;
           setError(failure);
         }
       }
@@ -278,6 +288,7 @@ export default function Viewer() {
               targetRenderer.clear();
               setPlaying(false);
               setDecodeFailed(true);
+              fileFailureRef.current = failure;
               setError(failure);
             });
         }
@@ -300,8 +311,8 @@ export default function Viewer() {
 
     return () => {
       running = false;
-      frameGeneration += 1;
-      pendingFrame = null;
+      invalidateFrame();
+      frameRequestRef.current = () => {};
       canvas.removeEventListener("webglcontextlost", contextLost);
       canvas.removeEventListener("webglcontextrestored", contextRestored);
       renderer.dispose();
@@ -345,6 +356,7 @@ export default function Viewer() {
     playback.playing = false;
     playback.time = 0;
     playback.rendered = undefined;
+    fileFailureRef.current = null;
     setPlaying(false);
     setScene(null);
     setError(null);
@@ -375,7 +387,10 @@ export default function Viewer() {
       playback.rendered = 0;
       setScene(playable);
     } catch (failure) {
-      if (current()) setError(failure);
+      if (current()) {
+        fileFailureRef.current = failure;
+        setError(failure);
+      }
     } finally {
       if (current()) setBusy(false);
     }
@@ -434,7 +449,12 @@ export default function Viewer() {
   const seek = useCallback((value) => {
     const playback = playbackRef.current;
     if (playback.playable === null) return;
-    playback.time = Math.max(0, Math.min(value, lastInstant(playback.playable.duration)));
+    const wanted = Math.max(0, Math.min(value, lastInstant(playback.playable.duration)));
+    if (wanted === playback.time) return;
+    // A range read may never settle. Revoke its pending slot and publication rights so
+    // this explicit seek can start independently and a late older result stays stale.
+    frameRequestRef.current();
+    playback.time = wanted;
   }, []);
 
   const togglePlay = useCallback(() => {
@@ -583,7 +603,13 @@ export default function Viewer() {
             type="file"
             accept=".4dgs,application/octet-stream"
             disabled={setupFailed}
-            onChange={(event) => openFile(event.target.files[0])}
+            onChange={(event) => {
+              const file = event.target.files[0];
+              // Browsers suppress a second change event for the same selected path unless
+              // the control is reset after each attempt, including refused files.
+              event.target.value = "";
+              openFile(file);
+            }}
           />
         </label>
         <div className={styles.urlRow}>
@@ -672,7 +698,12 @@ function Facts({ scene, readout }) {
     ["Gaussians in the file", header.gaussianCount.toLocaleString()],
     ["Live at this instant", readout.count.toLocaleString()],
     ["Duration", `${scene.duration} s`],
-    ["Marginal cutoff", String(header.cutoff)],
+    [
+      "Marginal cutoff",
+      header.cutoff > 0
+        ? String(effectiveCutoff(header))
+        : `${effectiveCutoff(header)} (default; Header stores 0)`,
+    ],
     ["SH degree", String(header.shDegree)],
     ["Profile", header.profile === "" ? "—" : header.profile],
     ["Written by", header.library === "" ? "—" : header.library],

@@ -37,9 +37,11 @@ export default function App() {
         <section>
           <h2>Known SDK limits</h2>
           <p>
-            The current TypeScript SDK does not expose a bounded <code>IReadable</code> decoder for
-            keyframe-delta data or an incremental unindexed gaussian-birth population. The viewer
-            names those limitations instead of claiming those paths are bounded.
+            Complete indexed keyframe-delta files use the SDK&apos;s bounded range reader. For a
+            truncated keyframe-delta prefix, the current TypeScript SDK exposes only a whole-
+            <code>Uint8Array</code> streamed decoder; it also does not expose an incremental
+            unindexed gaussian-birth population. The viewer names those limitations instead of
+            claiming those recovery paths are bounded.
           </p>
         </section>
       </main>
