@@ -142,7 +142,12 @@ function serveRange(file, request, response) {
 /** Launch Chrome and connect to its browser-level DevTools endpoint. */
 export async function launchChrome(
   executable,
-  { endpointTimeoutMs = 30000, spawnImpl = spawn } = {},
+  {
+    endpointTimeoutMs = 30000,
+    socketTimeoutMs = 30000,
+    spawnImpl = spawn,
+    WebSocketImpl = WebSocket,
+  } = {},
 ) {
   const profile = await mkdtemp(path.join(tmpdir(), "4dgs-viewer-test-"));
   const child = spawnImpl(
@@ -180,12 +185,14 @@ export async function launchChrome(
 
   let socket;
   try {
-    socket = new WebSocket(endpoint);
-    await new Promise((resolve, reject) => {
-      socket.addEventListener("open", resolve, { once: true });
-      socket.addEventListener("error", reject, { once: true });
-    });
+    socket = new WebSocketImpl(endpoint);
+    await connectSocket(socket, socketTimeoutMs);
   } catch (failure) {
+    try {
+      socket?.close();
+    } catch {
+      /* construction or handshake already failed */
+    }
     await cleanup();
     throw failure;
   }
@@ -227,6 +234,29 @@ export async function launchChrome(
       await cleanup();
     },
   };
+}
+
+/** Bound the second launch phase: an endpoint alone does not make DevTools reachable. */
+function connectSocket(socket, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (operation, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.removeEventListener("open", onOpen);
+      socket.removeEventListener("error", onError);
+      operation(value);
+    };
+    const onOpen = () => finish(resolve);
+    const onError = () => finish(reject, new Error("Chrome DevTools WebSocket failed to connect"));
+    const timer = setTimeout(
+      () => finish(reject, new Error("Chrome DevTools WebSocket did not connect in time")),
+      timeoutMs,
+    );
+    socket.addEventListener("open", onOpen, { once: true });
+    socket.addEventListener("error", onError, { once: true });
+  });
 }
 
 /** Wait for Chrome's DevTools endpoint, removing listeners whichever outcome wins. */

@@ -409,6 +409,36 @@ describe("the viewer in a browser", { skip: available ? false : "no Chrome found
     assert.equal(existsSync(profile), false, `temporary profile survived at ${profile}`);
   });
 
+  it("kills Chrome and removes its profile when the DevTools socket stalls", async () => {
+    const child = new EventEmitter();
+    child.stderr = new PassThrough();
+    let killedWith = null;
+    let profile = null;
+    child.kill = (signal) => {
+      killedWith = signal;
+      return true;
+    };
+    class StalledSocket extends EventTarget {}
+    await assert.rejects(
+      () =>
+        launchChrome("unused", {
+          endpointTimeoutMs: 100,
+          socketTimeoutMs: 10,
+          WebSocketImpl: StalledSocket,
+          spawnImpl(_executable, args) {
+            profile = args
+              .find((argument) => argument.startsWith("--user-data-dir="))
+              .slice("--user-data-dir=".length);
+            queueMicrotask(() => child.stderr.write("DevTools listening on ws://test/devtools\n"));
+            return child;
+          },
+        }),
+      /WebSocket did not connect in time/,
+    );
+    assert.equal(killedWith, "SIGKILL");
+    assert.equal(existsSync(profile), false, `temporary profile survived at ${profile}`);
+  });
+
   it("opens a corpus file and shows the file's own facts", async () => {
     const page = await viewer();
     await page.waitFor(
