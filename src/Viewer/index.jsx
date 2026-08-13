@@ -423,7 +423,10 @@ export default function Viewer() {
     } catch (failure) {
       if (current()) {
         fileFailureRef.current = failure;
-        setError(failure);
+        // A file or transport failure can finish after context loss. Retain it so WebGL
+        // restoration can reveal the file's answer, but until then the blank, disabled
+        // viewer is caused by the renderer capability failure and must continue to say so.
+        setError(setupFailureRef.current ?? failure);
       }
     } finally {
       if (current()) setBusy(false);

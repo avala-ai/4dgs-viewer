@@ -179,6 +179,42 @@ const forceViewportLimit = (width, height) => `
   })();
 `;
 
+/** Hold one local-file slice until the test rejects it. */
+const CONTROL_BLOB_READ = `
+  (() => {
+    const real = Blob.prototype.arrayBuffer;
+    globalThis.__holdViewerBlobRead = false;
+    globalThis.__viewerBlobReadHeld = 0;
+    globalThis.__rejectViewerBlobRead = null;
+    Blob.prototype.arrayBuffer = function () {
+      if (!globalThis.__holdViewerBlobRead) return real.call(this);
+      globalThis.__holdViewerBlobRead = false;
+      globalThis.__viewerBlobReadHeld += 1;
+      return new Promise((resolve, reject) => {
+        globalThis.__rejectViewerBlobRead = () => {
+          globalThis.__rejectViewerBlobRead = null;
+          reject(new Error("the held local-file read failed for the test"));
+        };
+      });
+    };
+  })();
+`;
+
+/** Let context loss happen but keep the renderer unavailable until the page closes. */
+const KEEP_CONTEXT_LOST = `
+  (() => {
+    const real = WebGL2RenderingContext.prototype.getExtension;
+    WebGL2RenderingContext.prototype.getExtension = function (name) {
+      const extension = real.call(this, name);
+      if (name !== "WEBGL_lose_context" || extension === null) return extension;
+      return {
+        loseContext: () => extension.loseContext(),
+        restoreContext: () => {},
+      };
+    };
+  })();
+`;
+
 /** Let a test turn otherwise valid URL range reads into transport failures. */
 const FAIL_RANGES_ON_DEMAND = `
   (() => {
@@ -644,6 +680,34 @@ describe("the viewer in a browser", { skip: available ? false : "no Chrome found
     const after = await page.evaluate(readState);
     assert.equal(after.refusalTitle, null);
     assert.equal(after.playDisabled, false);
+    await page.close();
+  });
+
+  it("keeps context loss visible when an in-flight open later refuses", async () => {
+    const page = await viewer(CONTROL_BLOB_READ, KEEP_CONTEXT_LOST);
+    await page.evaluate(() => {
+      globalThis.__holdViewerBlobRead = true;
+      return true;
+    });
+    await page.evaluate(pickFile, `${site.base}/corpus/${VALID}`);
+    await page.waitFor(() => globalThis.__viewerBlobReadHeld === 1, {
+      what: "the deliberately held local-file read",
+    });
+    await page.evaluate(loseContext);
+    await page.waitFor(refused, { what: "the WebGL context-loss refusal" });
+    const lost = await page.evaluate(readState);
+    assert.equal(lost.refusalTitle, "ViewerCapabilityError");
+
+    await page.evaluate(() => {
+      globalThis.__rejectViewerBlobRead();
+      return true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const afterFileFailure = await page.evaluate(readState);
+    assert.equal(afterFileFailure.refusalTitle, "ViewerCapabilityError");
+    assert.match(afterFileFailure.refusalBody, /WebGL2 context was lost/);
+    assert.doesNotMatch(afterFileFailure.refusalBody, /held local-file read failed/);
+    assert.equal(afterFileFailure.fileDisabled, true);
     await page.close();
   });
 

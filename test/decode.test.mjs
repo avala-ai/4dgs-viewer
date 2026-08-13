@@ -244,6 +244,33 @@ describe("camera framing survives asynchronous and sparse opens", () => {
     assert.deepEqual(installed.current, [empty]);
   });
 
+  it("bounds the required landing frame when its range never settles", async () => {
+    let calls = 0;
+    await assert.rejects(
+      () =>
+        frameCamera(
+          {
+            duration: 1,
+            frameAt() {
+              calls += 1;
+              return new Promise(() => {});
+            },
+          },
+          () => ({ setFrame() {} }),
+          null,
+          () => true,
+          undefined,
+          undefined,
+          10,
+        ),
+      (error) =>
+        error instanceof ViewerLimitError &&
+        error.message.includes("frame at 0 s") &&
+        error.message.includes("within 0.01 seconds"),
+    );
+    assert.equal(calls, 1, "landing timeout must not poll the stranded range");
+  });
+
   it("falls back to the Header AABB when fixed probes miss sparse visibility", async () => {
     const probes = [];
     const framed = [];

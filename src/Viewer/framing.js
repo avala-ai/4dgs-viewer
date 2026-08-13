@@ -1,4 +1,5 @@
 import { boundsOf } from "./camera.js";
+import { FRAME_READ_TIMEOUT_MS, frameAtWithin } from "./openScene.js";
 
 /** Times to try when looking for a non-empty instant to frame the camera on. */
 const FRAMING_PROBES = [0, 0.25, 0.5, 0.75, 0.999];
@@ -20,10 +21,12 @@ export async function frameCamera(
   isCurrent,
   refusalName = (failure) => failure?.name ?? "Error",
   probeTimeoutMs = FRAMING_PROBE_TIMEOUT_MS,
+  landingTimeoutMs = FRAME_READ_TIMEOUT_MS,
 ) {
   // The instant the visitor lands on. A refusal here is the file's answer to "can you open
-  // this", and is allowed to propagate.
-  const first = await playable.frameAt(0);
+  // this", and is allowed to propagate. It still shares the displayed-frame liveness
+  // bound: metadata opening successfully does not entitle its first Chunk to hang forever.
+  const first = await frameAtWithin(playable, 0, landingTimeoutMs);
   // A file the visitor has already moved on from does not get to put a frame on the canvas
   // or move the camera; its caller will discard the rest of this open too.
   if (!isCurrent()) return [];
