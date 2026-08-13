@@ -105,6 +105,14 @@ export default function Viewer() {
     }
     rendererRef.current = renderer;
     cameraRef.current = new OrbitCamera();
+    const wheel = (event) => {
+      // This must be a non-passive native listener. React delegates wheel events through
+      // a passive root listener, where preventDefault cannot keep the page from scrolling.
+      event.preventDefault();
+      const camera = cameraRef.current;
+      if (camera !== null) camera.dolly(Math.exp(event.deltaY * 0.001));
+    };
+    canvas.addEventListener("wheel", wheel, { passive: false });
 
     let running = true;
     let contextIsLost = false;
@@ -257,14 +265,19 @@ export default function Viewer() {
       const playable = playback.playable;
 
       if (playable !== null) {
-        if (playback.playing && playable.duration > 0) {
+        // The clock describes the frame on screen. Pause it while that frame is being
+        // fetched rather than letting a slow range leave canvas and readouts seconds apart.
+        // A never-settling request also keeps its one authoritative timeout: it cannot be
+        // invalidated by loop wrap and revisited once per iteration.
+        const pendingCurrent =
+          pendingFrame !== null &&
+          pendingFrame.serial === playback.serial &&
+          pendingFrame.generation === frameGeneration;
+        if (!pendingCurrent && playback.playing && playable.duration > 0) {
           playback.time += dt;
           if (playback.time >= playable.duration) {
             // The timeline is the half-open [0, duration): the end is never a valid instant.
             if (playback.loop) {
-              // Loop wrap is a discontinuous seek. A read for the old end may never
-              // settle, so release its slot before requesting the start again.
-              invalidateFrame();
               playback.time = 0;
             } else {
               playback.time = lastInstant(playable.duration);
@@ -275,10 +288,6 @@ export default function Viewer() {
         }
         // One instant in flight at a time for the current open and renderer generation.
         // A request owned by an older open or a lost context does not occupy this slot.
-        const pendingCurrent =
-          pendingFrame !== null &&
-          pendingFrame.serial === playback.serial &&
-          pendingFrame.generation === frameGeneration;
         if (!pendingCurrent && playback.rendered !== playback.time) {
           const wanted = playback.time;
           const targetRenderer = renderer;
@@ -286,14 +295,17 @@ export default function Viewer() {
           frameAtWithin(playable, wanted)
             .then((frame) => {
               releaseFrame(token);
-              if (!frameIsCurrent(token)) return;
-              playbackRef.current.rendered = wanted;
+              const current = playbackRef.current;
+              if (!frameIsCurrent(token) || current.time !== wanted) return;
+              current.rendered = wanted;
               targetRenderer.setFrame(frame);
             })
             .catch((failure) => {
               releaseFrame(token);
-              if (!frameIsCurrent(token)) return;
-              playbackRef.current.playable = null;
+              const current = playbackRef.current;
+              if (!frameIsCurrent(token) || current.time !== wanted) return;
+              current.playable = null;
+              current.playing = false;
               targetRenderer.clear();
               setPlaying(false);
               setDecodeFailed(true);
@@ -322,6 +334,7 @@ export default function Viewer() {
       running = false;
       invalidateFrame();
       frameRequestRef.current = () => {};
+      canvas.removeEventListener("wheel", wheel);
       canvas.removeEventListener("webglcontextlost", contextLost);
       canvas.removeEventListener("webglcontextrestored", contextRestored);
       renderer.dispose();
@@ -447,12 +460,6 @@ export default function Viewer() {
     dragRef.current = null;
   }, []);
 
-  const onWheel = useCallback((event) => {
-    const camera = cameraRef.current;
-    if (camera === null) return;
-    camera.dolly(Math.exp(event.deltaY * 0.001));
-  }, []);
-
   // --- transport -----------------------------------------------------------
 
   const seek = useCallback((value) => {
@@ -525,7 +532,6 @@ export default function Viewer() {
           onPointerMove={onPointerMove}
           onPointerUp={onPointerUp}
           onPointerCancel={onPointerUp}
-          onWheel={onWheel}
           onContextMenu={(event) => event.preventDefault()}
         />
         {scene === null && error === null && (

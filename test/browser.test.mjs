@@ -150,11 +150,17 @@ const CONTROL_NEXT_RANGE = `
     globalThis.__nextViewerRange = "pass";
     globalThis.__viewerRangeHeld = 0;
     globalThis.__viewerRangeHung = 0;
+    globalThis.__hangAllViewerRanges = false;
     globalThis.__releaseViewerRange = null;
     globalThis.fetch = function (input, init) {
       const range = new Headers(init && init.headers).get("range");
       const mode = globalThis.__nextViewerRange;
-      if (range === null || mode === "pass") return real(input, init);
+      if (range === null) return real(input, init);
+      if (globalThis.__hangAllViewerRanges) {
+        globalThis.__viewerRangeHung += 1;
+        return new Promise(() => {});
+      }
+      if (mode === "pass") return real(input, init);
       globalThis.__nextViewerRange = "pass";
       if (mode === "hang") {
         globalThis.__viewerRangeHung += 1;
@@ -487,6 +493,25 @@ describe("the viewer in a browser", { skip: available ? false : "no Chrome found
     await page.close();
   });
 
+  it("owns the canvas wheel gesture instead of scrolling the document", async () => {
+    const page = await viewer();
+    await page.waitFor(
+      () => {
+        const event = new WheelEvent("wheel", { deltaY: 1, bubbles: true, cancelable: true });
+        document.querySelector("canvas")?.dispatchEvent(event);
+        return event.defaultPrevented;
+      },
+      { what: "the non-passive canvas wheel listener" },
+    );
+    const prevented = await page.evaluate(() => {
+      const event = new WheelEvent("wheel", { deltaY: 120, bubbles: true, cancelable: true });
+      document.querySelector("canvas").dispatchEvent(event);
+      return event.defaultPrevented;
+    });
+    assert.equal(prevented, true);
+    await page.close();
+  });
+
   it("surfaces WebGL context loss and rebuilds after restoration", async () => {
     const page = await viewer();
     await page.evaluate(pickFile, `${site.base}/corpus/${VALID}`);
@@ -642,27 +667,56 @@ describe("the viewer in a browser", { skip: available ? false : "no Chrome found
     await page.close();
   });
 
-  it("releases a pending end read when looping wraps to the start", async () => {
+  it("keeps one stranded playback range authoritative instead of looping past it", async () => {
     const page = await viewer(CONTROL_NEXT_RANGE, TRACK_UPLOADS_AND_FAST_CLOCK);
     await page.evaluate(openUrl, `${site.base}/range/${MULTI_CHUNK}`);
     await page.waitFor(opened, { what: "the URL-backed scene" });
     await page.evaluate(() => {
-      globalThis.__nextViewerRange = "hang";
-      return true;
-    });
-    await page.evaluate(seekFraction, 0.75);
-    await page.waitFor(() => globalThis.__viewerRangeHung === 1, {
-      what: "the intentionally stranded end-range read",
-    });
-    await page.evaluate(() => {
-      globalThis.__uploadsBeforeLoop = globalThis.__viewerFrameUploads;
+      globalThis.__hangAllViewerRanges = true;
       globalThis.__fastViewerClock = true;
       [...document.querySelectorAll("button")].find((button) => button.textContent === "Play").click();
       return true;
     });
+    await page.waitFor(() => globalThis.__viewerRangeHung === 1, {
+      what: "the playback-driven range to become stranded",
+    });
+    // The synthetic clock can traverse this 20-second scene more than once in this
+    // interval. It must buffer at the first missing frame instead of wrapping, revoking
+    // that timeout, and starting another permanently hung transport promise each loop.
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+    const hung = await page.evaluate(() => globalThis.__viewerRangeHung);
+    assert.equal(hung, 1);
+    await page.close();
+  });
+
+  it("holds playback time on the exact frame while its range read is pending", async () => {
+    const page = await viewer(CONTROL_NEXT_RANGE, TRACK_UPLOADS_AND_FAST_CLOCK);
+    await page.evaluate(openUrl, `${site.base}/range/${MULTI_CHUNK}`);
+    await page.waitFor(opened, { what: "the URL-backed scene" });
+    await page.evaluate(() => {
+      globalThis.__nextViewerRange = "hold";
+      globalThis.__fastViewerClock = true;
+      [...document.querySelectorAll("button")].find((button) => button.textContent === "Play").click();
+      return true;
+    });
+    await page.waitFor(() => globalThis.__viewerRangeHeld === 1, {
+      what: "ordinary playback waiting on a held range",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    const before = await page.evaluate(readState);
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const during = await page.evaluate(readState);
+    assert.equal(during.scrubValue, before.scrubValue);
+    assert.equal(during.clock, before.clock);
+
+    await page.evaluate(() => {
+      globalThis.__uploadsBeforeRelease = globalThis.__viewerFrameUploads;
+      globalThis.__releaseViewerRange();
+      return true;
+    });
     await page.waitFor(
-      () => globalThis.__viewerFrameUploads > globalThis.__uploadsBeforeLoop,
-      { what: "a frame published after loop wrap released the stranded end read" },
+      () => globalThis.__viewerFrameUploads > globalThis.__uploadsBeforeRelease,
+      { what: "the held instant to publish after its range settles" },
     );
     await page.close();
   });
