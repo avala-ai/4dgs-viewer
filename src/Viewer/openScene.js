@@ -20,6 +20,7 @@
 import {
   Cursor,
   DEFAULT_CUTOFF,
+  FOOTER_TAIL_BYTES,
   FrontMatterScanner,
   HEAD_PROBE_BYTES,
   IndexedDecoder,
@@ -34,6 +35,7 @@ import {
   decodeKeyframeDeltaStreamed,
   decodeScene,
   parseHeader,
+  readRecord,
   stateAtWithObjects,
 } from "@4dgs/core";
 
@@ -699,7 +701,7 @@ export function concatSh(chunks) {
  * the whole resource is read before anything is composed. The page says so.
  */
 async function openKeyframeDelta(source, size) {
-  if (await hasTerminalMagic(source, size)) {
+  if (await hasTerminalFooter(source, size)) {
     return indexedKeyframePlayable(
       await KeyframeDeltaIndexedDecoder.open(source),
       source,
@@ -802,11 +804,23 @@ function indexedKeyframePlayable(decoder, source) {
   };
 }
 
-async function hasTerminalMagic(source, size) {
-  if (size < MAGIC.length) return false;
-  return endsWithMagic(
-    await source.read(BigInt(size - MAGIC.length), BigInt(MAGIC.length)),
-  );
+/** Whether the resource ends in one correctly framed fixed Footer and trailing magic. */
+async function hasTerminalFooter(source, size) {
+  if (size < FOOTER_TAIL_BYTES) return false;
+  const offset = size - FOOTER_TAIL_BYTES;
+  const tail = await source.read(BigInt(offset), BigInt(FOOTER_TAIL_BYTES));
+  if (tail.length !== FOOTER_TAIL_BYTES || !endsWithMagic(tail)) {
+    return false;
+  }
+  try {
+    const footer = readRecord(new Cursor(tail, 0, offset));
+    return (
+      footer.opcode === Opcode.Footer &&
+      footer.length === FOOTER_TAIL_BYTES - MAGIC.length
+    );
+  } catch {
+    return false;
+  }
 }
 
 function endsWithMagic(data) {

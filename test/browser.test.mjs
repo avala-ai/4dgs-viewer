@@ -128,16 +128,22 @@ const forceTextureLimit = (limit) => `
   })();
 `;
 
-/** Make the first requested texture allocation report WebGL OUT_OF_MEMORY. */
-const FAIL_FIRST_TEXTURE_ALLOCATION = `
+/** Make `count` requested texture images report WebGL OUT_OF_MEMORY, then recover. */
+const failTextureAllocationCalls = (count) => `
   (() => {
     const realImage = WebGL2RenderingContext.prototype.texImage2D;
     const realError = WebGL2RenderingContext.prototype.getError;
-    globalThis.__failViewerTextureAllocation = true;
+    globalThis.__viewerTextureFailuresLeft = ${count};
+    globalThis.__viewerTextureAllocations = [];
     let error = 0;
     WebGL2RenderingContext.prototype.texImage2D = function (...args) {
-      if (globalThis.__failViewerTextureAllocation) {
-        globalThis.__failViewerTextureAllocation = false;
+      globalThis.__viewerTextureAllocations.push({
+        width: args[3],
+        height: args[4],
+        format: args[2],
+      });
+      if (globalThis.__viewerTextureFailuresLeft > 0) {
+        globalThis.__viewerTextureFailuresLeft -= 1;
         error = this.OUT_OF_MEMORY;
         return;
       }
@@ -150,6 +156,25 @@ const FAIL_FIRST_TEXTURE_ALLOCATION = `
         return result;
       }
       return realError.call(this);
+    };
+  })();
+`;
+
+/** Advertise a small viewport ceiling and record any call that violates it. */
+const forceViewportLimit = (width, height) => `
+  (() => {
+    const realParameter = WebGL2RenderingContext.prototype.getParameter;
+    const realViewport = WebGL2RenderingContext.prototype.viewport;
+    globalThis.__viewerViewportOverflow = false;
+    globalThis.__viewerViewports = [];
+    WebGL2RenderingContext.prototype.getParameter = function (name) {
+      if (name === this.MAX_VIEWPORT_DIMS) return new Int32Array([${width}, ${height}]);
+      return realParameter.call(this, name);
+    };
+    WebGL2RenderingContext.prototype.viewport = function (x, y, w, h) {
+      globalThis.__viewerViewports.push([x, y, w, h]);
+      if (w > ${width} || h > ${height}) globalThis.__viewerViewportOverflow = true;
+      return realViewport.call(this, x, y, w, h);
     };
   })();
 `;
@@ -520,8 +545,24 @@ describe("the viewer in a browser", { skip: available ? false : "no Chrome found
     await page.close();
   });
 
+  it("retries a failed speculative texture growth at the requested capacity", async () => {
+    const page = await viewer(failTextureAllocationCalls(1));
+    await page.evaluate(pickFile, `${site.base}/corpus/${VALID}`);
+    await page.waitFor(opened, { what: "the scene after exact-capacity retry" });
+    const state = await page.evaluate(readState);
+    const allocations = await page.evaluate(() => globalThis.__viewerTextureAllocations);
+    assert.equal(state.refusalTitle, null);
+    assert.equal(allocations.length, 4, "one failed pair must be followed by one retry pair");
+    assert.ok(
+      allocations[2].height < allocations[0].height,
+      `retry did not shed speculative capacity: ${JSON.stringify(allocations)}`,
+    );
+    await page.close();
+  });
+
   it("refuses a failed GPU texture allocation without committing its capacity", async () => {
-    const page = await viewer(FAIL_FIRST_TEXTURE_ALLOCATION);
+    // Two images per attempt: fail both the speculative allocation and its exact retry.
+    const page = await viewer(failTextureAllocationCalls(4));
     await page.evaluate(pickFile, `${site.base}/corpus/${VALID}`);
     await page.waitFor(refused, { what: "the texture-allocation refusal" });
     const failed = await page.evaluate(readState);
@@ -536,6 +577,32 @@ describe("the viewer in a browser", { skip: available ? false : "no Chrome found
     await page.waitFor(opened, { what: "the scene after retrying texture allocation" });
     const retried = await page.evaluate(readState);
     assert.equal(retried.refusalTitle, null);
+    await page.close();
+  });
+
+  it("keeps the drawing buffer and viewport within the device limit", async () => {
+    const maximum = { width: 128, height: 64 };
+    const page = await viewer(
+      PRESERVE_BUFFER,
+      forceViewportLimit(maximum.width, maximum.height),
+    );
+    await page.evaluate(pickFile, `${site.base}/corpus/${VALID}`);
+    await page.waitFor(opened);
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    const result = await page.evaluate(() => {
+      const canvas = document.querySelector("canvas");
+      return {
+        width: canvas.width,
+        height: canvas.height,
+        overflow: globalThis.__viewerViewportOverflow,
+        calls: globalThis.__viewerViewports,
+      };
+    });
+    const pixels = await page.evaluate(countDrawnPixels);
+    assert.ok(result.width <= maximum.width, `${result.width} > ${maximum.width}`);
+    assert.ok(result.height <= maximum.height, `${result.height} > ${maximum.height}`);
+    assert.equal(result.overflow, false, JSON.stringify(result.calls));
+    assert.ok(pixels.drawn > 0, "the bounded buffer must still draw the scene");
     await page.close();
   });
 

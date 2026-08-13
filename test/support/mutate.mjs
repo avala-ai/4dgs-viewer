@@ -392,3 +392,20 @@ export function cutAfterChunk(bytes, n) {
   const last = chunkRecords[n];
   return { bytes: bytes.slice(0, last.offset + last.length), chunkIndex: n };
 }
+
+/**
+ * Append one legal private record whose arbitrary payload happens to end in file magic.
+ *
+ * It is not a Footer and there is no trailing marker after it. A marker-only completeness
+ * probe therefore gets a false positive, while a structural terminal check does not.
+ */
+export function appendPrivateRecordEndingMagic(bytes) {
+  const content = new Uint8Array(4 + MAGIC.length);
+  content.set([0xde, 0xad, 0xbe, 0xef]);
+  content.set(MAGIC, 4);
+  const framed = new Uint8Array(RECORD_HEADER_BYTES + content.length);
+  framed[0] = 0x80;
+  new DataView(framed.buffer).setBigUint64(1, BigInt(content.length), true);
+  framed.set(content, RECORD_HEADER_BYTES);
+  return join([bytes, framed]);
+}

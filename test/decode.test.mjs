@@ -47,6 +47,7 @@ import {
   variants,
 } from "./support/corpus.mjs";
 import {
+  appendPrivateRecordEndingMagic,
   cutAfterChunk,
   withBadSummaryCrc,
   withDuplicateIndexOffset,
@@ -686,6 +687,31 @@ describe("§11.10: a keyframe-delta timeline ends where its chunks do", () => {
       MalformedFile,
       "an instant past the last complete chunk must be refused, not answered with stale state",
     );
+  });
+
+  it("does not mistake magic inside a truncated prefix's payload for a Footer", async () => {
+    const whole = variant(source);
+    const sequence = await decodeKeyframeDeltaStreamed(whole.bytes);
+    const keep = 1;
+    const cut = cutAfterChunk(whole.bytes, keep).bytes;
+    const bytes = appendPrivateRecordEndingMagic(cut);
+    assert.deepEqual(
+      bytes.subarray(bytes.length - MAGIC.length),
+      MAGIC,
+      "the payload must exercise the old marker-only check",
+    );
+
+    const playable = await openScene(new BytesReadable(bytes));
+    const covered = Math.max(
+      ...sequence.chunks.slice(0, keep + 1).map((chunk) => chunk.t1),
+    );
+    assert.equal(playable.readMode, "keyframe-delta");
+    assert.equal(playable.duration, covered);
+    assert.ok(
+      playable.notes.some((note) => note.includes("truncated keyframe-delta prefix")),
+      playable.notes.join("\n"),
+    );
+    assert.ok((await playable.frameAt(0)).count > 0);
   });
 
   it("storage order is not time order: coverage comes from the largest t1", async () => {

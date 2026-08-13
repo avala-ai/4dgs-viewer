@@ -220,6 +220,7 @@ export class SplatRenderer {
     // then samples a texture that was never allocated, which is a blank canvas and no
     // message. It is asked for once, here, and respected in `ensureCapacity`.
     this.maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+    this.maxViewportDims = gl.getParameter(gl.MAX_VIEWPORT_DIMS);
     this.geometryLayout = { width: TEXTURE_WIDTH, rows: 0, texels: 0 };
     this.colourLayout = { width: TEXTURE_WIDTH, rows: 0, texels: 0 };
     this.capacity = 0;
@@ -299,8 +300,24 @@ export class SplatRenderer {
   /** Draw the current frame from the current camera. */
   draw(camera) {
     const gl = this.gl;
-    const width = Math.max(1, Math.round(this.canvas.clientWidth * devicePixelRatio));
-    const height = Math.max(1, Math.round(this.canvas.clientHeight * devicePixelRatio));
+    const requestedWidth = Math.max(
+      1,
+      Math.round(this.canvas.clientWidth * devicePixelRatio),
+    );
+    const requestedHeight = Math.max(
+      1,
+      Math.round(this.canvas.clientHeight * devicePixelRatio),
+    );
+    // High-DPI CSS sizes can exceed the device's drawing-buffer ceiling even when the
+    // ordinary window is much smaller. Scale both axes together so projection and pixels
+    // retain the same aspect ratio, and never hand `viewport` an INVALID_VALUE.
+    const scale = Math.min(
+      1,
+      this.maxViewportDims[0] / requestedWidth,
+      this.maxViewportDims[1] / requestedHeight,
+    );
+    const width = Math.max(1, Math.floor(requestedWidth * scale));
+    const height = Math.max(1, Math.floor(requestedHeight * scale));
     if (this.canvas.width !== width || this.canvas.height !== height) {
       this.canvas.width = width;
       this.canvas.height = height;
@@ -443,57 +460,24 @@ export class SplatRenderer {
           `not draw it. A renderer that tiles its data across several textures would.`,
       );
     }
-    const capacity = Math.min(supported, Math.max(count, TEXTURE_WIDTH, this.capacity * 2));
-    const geometryLayout = layoutFor(capacity * 3, limit);
-    const colourLayout = layoutFor(capacity, limit);
-    // Whole rows, so a partial `texSubImage2D` always has the bytes it says it has.
-    const geometryData = new Float32Array(geometryLayout.texels * 4);
-    const colourData = new Uint8Array(colourLayout.texels * 4);
-    const depths = new Float32Array(capacity);
-    const order = new Uint32Array(capacity);
-
+    let capacity = Math.min(
+      supported,
+      Math.max(count, TEXTURE_WIDTH, this.capacity * 2),
+    );
     const gl = this.gl;
-    // Allocate into new textures so a failed growth cannot destroy the last working
-    // allocation or publish a capacity that later calls incorrectly consider available.
-    const geometryTexture = createTexture(gl);
-    const colourTexture = createTexture(gl);
-    while (gl.getError() !== gl.NO_ERROR) {
-      // Attribute following errors to these allocations, not to a stale earlier call.
+    let allocation = allocateCapacity(gl, capacity, limit);
+    if (allocation.error !== gl.NO_ERROR && capacity !== count) {
+      // Growth is speculative. A device that cannot reserve the doubled headroom may
+      // still be perfectly capable of drawing this requested frame, so retry exactly it
+      // before turning a memory-pressure signal into a capability refusal.
+      capacity = count;
+      allocation = allocateCapacity(gl, capacity, limit);
     }
-    gl.bindTexture(gl.TEXTURE_2D, geometryTexture);
-    gl.texImage2D(
-      gl.TEXTURE_2D,
-      0,
-      gl.RGBA32F,
-      geometryLayout.width,
-      geometryLayout.rows,
-      0,
-      gl.RGBA,
-      gl.FLOAT,
-      null,
-    );
-    let allocationError = gl.getError();
-    gl.bindTexture(gl.TEXTURE_2D, colourTexture);
-    gl.texImage2D(
-      gl.TEXTURE_2D,
-      0,
-      gl.RGBA8,
-      colourLayout.width,
-      colourLayout.rows,
-      0,
-      gl.RGBA,
-      gl.UNSIGNED_BYTE,
-      null,
-    );
-    const colourAllocationError = gl.getError();
-    if (allocationError === gl.NO_ERROR) allocationError = colourAllocationError;
-    if (allocationError !== gl.NO_ERROR) {
-      gl.deleteTexture(geometryTexture);
-      gl.deleteTexture(colourTexture);
+    if (allocation.error !== gl.NO_ERROR) {
       const why =
-        allocationError === gl.OUT_OF_MEMORY
+        allocation.error === gl.OUT_OF_MEMORY
           ? "the device reported OUT_OF_MEMORY"
-          : `WebGL reported error 0x${allocationError.toString(16)}`;
+          : `WebGL reported error 0x${allocation.error.toString(16)}`;
       throw new RendererCapabilityError(
         `WebGL2 could not allocate textures for ${capacity} live gaussians: ${why}. ` +
           "The file is fine; this device does not have enough available GPU capacity.",
@@ -502,17 +486,80 @@ export class SplatRenderer {
 
     gl.deleteTexture(this.geometryTexture);
     gl.deleteTexture(this.colourTexture);
-    this.geometryTexture = geometryTexture;
-    this.colourTexture = colourTexture;
-    this.geometryLayout = geometryLayout;
-    this.colourLayout = colourLayout;
-    this.geometryData = geometryData;
-    this.colourData = colourData;
-    this.depths = depths;
-    this.order = order;
+    this.geometryTexture = allocation.geometryTexture;
+    this.colourTexture = allocation.colourTexture;
+    this.geometryLayout = allocation.geometryLayout;
+    this.colourLayout = allocation.colourLayout;
+    this.geometryData = allocation.geometryData;
+    this.colourData = allocation.colourData;
+    this.depths = allocation.depths;
+    this.order = allocation.order;
     this.capacity = capacity;
     this.colouredForFrame = -1;
   }
+}
+
+/** Allocate one candidate capacity without disturbing the renderer's current textures. */
+function allocateCapacity(gl, capacity, limit) {
+  const geometryLayout = layoutFor(capacity * 3, limit);
+  const colourLayout = layoutFor(capacity, limit);
+  // Candidates are not published until both allocations succeed. A failed speculative
+  // growth can therefore be deleted and retried without destroying the working frame.
+  const geometryTexture = createTexture(gl);
+  const colourTexture = createTexture(gl);
+  while (gl.getError() !== gl.NO_ERROR) {
+    // Attribute following errors to these allocations, not to a stale earlier call.
+  }
+  gl.bindTexture(gl.TEXTURE_2D, geometryTexture);
+  gl.texImage2D(
+    gl.TEXTURE_2D,
+    0,
+    gl.RGBA32F,
+    geometryLayout.width,
+    geometryLayout.rows,
+    0,
+    gl.RGBA,
+    gl.FLOAT,
+    null,
+  );
+  let error = gl.getError();
+  gl.bindTexture(gl.TEXTURE_2D, colourTexture);
+  gl.texImage2D(
+    gl.TEXTURE_2D,
+    0,
+    gl.RGBA8,
+    colourLayout.width,
+    colourLayout.rows,
+    0,
+    gl.RGBA,
+    gl.UNSIGNED_BYTE,
+    null,
+  );
+  const colourError = gl.getError();
+  if (error === gl.NO_ERROR) error = colourError;
+  if (error !== gl.NO_ERROR) {
+    gl.deleteTexture(geometryTexture);
+    gl.deleteTexture(colourTexture);
+    return { error };
+  }
+  // Allocate CPU staging only after the device accepted the matching textures. In
+  // particular, a rejected speculative growth does not remain live during its retry.
+  // Whole rows ensure a partial `texSubImage2D` has every byte it declares.
+  const geometryData = new Float32Array(geometryLayout.texels * 4);
+  const colourData = new Uint8Array(colourLayout.texels * 4);
+  const depths = new Float32Array(capacity);
+  const order = new Uint32Array(capacity);
+  return {
+    error,
+    geometryTexture,
+    colourTexture,
+    geometryLayout,
+    colourLayout,
+    geometryData,
+    colourData,
+    depths,
+    order,
+  };
 }
 
 /**
