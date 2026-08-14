@@ -225,6 +225,44 @@ const FAIL_GEOMETRY_UPLOAD = `
   })();
 `;
 
+/** Make one colour-texture or sort-index upload report WebGL OUT_OF_MEMORY. */
+const failDrawUpload = (kind) => `
+  (() => {
+    const realTextureUpload = WebGL2RenderingContext.prototype.texSubImage2D;
+    const realBufferUpload = WebGL2RenderingContext.prototype.bufferData;
+    const realError = WebGL2RenderingContext.prototype.getError;
+    globalThis.__viewerDrawUploadFailure = ${JSON.stringify(kind)};
+    globalThis.__viewerDrawUploadFailures = 0;
+    let error = 0;
+    WebGL2RenderingContext.prototype.texSubImage2D = function (...args) {
+      if (globalThis.__viewerDrawUploadFailure === "colour" && args[7] === this.UNSIGNED_BYTE) {
+        globalThis.__viewerDrawUploadFailure = null;
+        globalThis.__viewerDrawUploadFailures += 1;
+        error = this.OUT_OF_MEMORY;
+        return;
+      }
+      return realTextureUpload.apply(this, args);
+    };
+    WebGL2RenderingContext.prototype.bufferData = function (...args) {
+      if (globalThis.__viewerDrawUploadFailure === "sort" && args[2] === this.DYNAMIC_DRAW) {
+        globalThis.__viewerDrawUploadFailure = null;
+        globalThis.__viewerDrawUploadFailures += 1;
+        error = this.OUT_OF_MEMORY;
+        return;
+      }
+      return realBufferUpload.apply(this, args);
+    };
+    WebGL2RenderingContext.prototype.getError = function () {
+      if (error !== 0) {
+        const result = error;
+        error = 0;
+        return result;
+      }
+      return realError.call(this);
+    };
+  })();
+`;
+
 /** Advertise a small viewport ceiling and record any call that violates it. */
 const forceViewportLimit = (width, height) => `
   (() => {
@@ -855,6 +893,39 @@ describe("the viewer in a browser", { skip: available ? false : "no Chrome found
     await page.close();
   });
 
+  it("refuses a failed colour upload before marking its state current", async () => {
+    const page = await viewer(failDrawUpload("colour"));
+    await page.evaluate(pickFile, `${site.base}/corpus/${VALID}`);
+    await page.waitFor(refused, { what: "the colour-upload refusal" });
+    const failed = await page.evaluate(readState);
+    assert.equal(failed.refusalTitle, "RendererCapabilityError");
+    assert.match(failed.refusalBody, /could not upload colours/);
+    assert.match(failed.refusalBody, /OUT_OF_MEMORY/);
+    assert.match(failed.refusalBody, /not marked current/);
+    assert.equal(await page.evaluate(() => globalThis.__viewerDrawUploadFailures), 1);
+    assert.equal(failed.playDisabled, true);
+
+    await page.evaluate(pickFile, `${site.base}/corpus/${VALID}`);
+    await page.waitFor(opened, { what: "the scene after retrying the colour upload" });
+    await page.close();
+  });
+
+  it("refuses a failed sort-buffer upload before drawing", async () => {
+    const page = await viewer(failDrawUpload("sort"));
+    await page.evaluate(pickFile, `${site.base}/corpus/${VALID}`);
+    await page.waitFor(refused, { what: "the sort-buffer refusal" });
+    const failed = await page.evaluate(readState);
+    assert.equal(failed.refusalTitle, "RendererCapabilityError");
+    assert.match(failed.refusalBody, /could not upload sort indices/);
+    assert.match(failed.refusalBody, /OUT_OF_MEMORY/);
+    assert.equal(await page.evaluate(() => globalThis.__viewerDrawUploadFailures), 1);
+    assert.equal(failed.playDisabled, true);
+
+    await page.evaluate(pickFile, `${site.base}/corpus/${VALID}`);
+    await page.waitFor(opened, { what: "the scene after retrying the sort-buffer upload" });
+    await page.close();
+  });
+
   it("keeps the drawing buffer and viewport within the device limit", async () => {
     const maximum = { width: 128, height: 64 };
     const page = await viewer(
@@ -1026,6 +1097,69 @@ describe("the viewer in a browser", { skip: available ? false : "no Chrome found
       },
       { what: "a later seek past the still-stranded read" },
     );
+    await page.close();
+  });
+
+  it("retains timeout authority for reads invalidated by repeated context loss", async () => {
+    const page = await viewer(CONTROL_NEXT_RANGE, SHORTEN_FRAME_TIMEOUT);
+    await page.evaluate(openUrl, `${site.base}/range/${MULTI_CHUNK}`);
+    await page.waitFor(opened, { what: "the URL-backed scene" });
+    await page.evaluate(() => {
+      globalThis.__shortenViewerFrameTimeout = true;
+      globalThis.__viewerShortFrameTimeoutMs = 1800;
+      globalThis.__nextViewerRange = "hang";
+      return true;
+    });
+    await page.evaluate(seekFraction, 0.75);
+    await page.waitFor(() => globalThis.__viewerRangeHung === 1, {
+      what: "the first context-invalidated range",
+    });
+    await page.evaluate(loseContext);
+    await page.waitFor(refused, { what: "the first context-loss refusal" });
+    await page.evaluate(() => window.__restoreWebglForTest());
+    await page.waitFor(
+      () => {
+        const live = [...document.querySelectorAll("dt")].find(
+          (entry) => entry.textContent === "Live at this instant",
+        );
+        return Number(live?.nextElementSibling?.textContent.replace(/,/g, "")) === 24;
+      },
+      { what: "the first independently restored frame" },
+    );
+
+    await page.evaluate(() => {
+      globalThis.__nextViewerRange = "hang";
+      return true;
+    });
+    await page.evaluate(seekFraction, 0.25);
+    await page.waitFor(() => globalThis.__viewerRangeHung === 2, {
+      what: "the second context-invalidated range",
+    });
+    await page.evaluate(loseContext);
+    await page.waitFor(
+      () => document.querySelector("h3")?.textContent === "ViewerCapabilityError",
+      { what: "the second context-loss refusal" },
+    );
+    await page.evaluate(() => window.__restoreWebglForTest());
+    await page.waitFor(
+      () => {
+        const live = [...document.querySelectorAll("dt")].find(
+          (entry) => entry.textContent === "Live at this instant",
+        );
+        return Number(live?.nextElementSibling?.textContent.replace(/,/g, "")) === 19;
+      },
+      { what: "the second independently restored frame" },
+    );
+
+    await page.waitFor(
+      () => document.querySelector("pre")?.textContent.includes("did not settle within 15 seconds"),
+      { what: "the first invalidated range's authoritative timeout" },
+    );
+    const state = await page.evaluate(readState);
+    assert.equal(state.refusalTitle, "ViewerLimitError");
+    assert.equal(state.playDisabled, true);
+    assert.equal(state.scrubDisabled, true);
+    assert.equal(await page.evaluate(() => globalThis.__viewerRangeHung), 2);
     await page.close();
   });
 

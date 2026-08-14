@@ -29,7 +29,7 @@ import styles from "./styles.module.css";
 
 /** How often the readouts under the canvas are allowed to re-render, in milliseconds. */
 const READOUT_INTERVAL = 100;
-/** Longest remote metadata/index opening may retain the page's busy state. */
+/** Longest metadata/index opening may retain the page's busy state. */
 const OPENING_TIMEOUT_MS = 15_000;
 
 class ViewerCapabilityError extends Error {
@@ -62,7 +62,7 @@ export default function Viewer() {
   const fileFailureRef = useRef(null);
   /** The last open attempted during a recoverable context loss. */
   const pendingOpenRef = useRef(null);
-  /** Cancels every fetch owned by the current URL resource when it is replaced. */
+  /** Cancels the current URL fetches or stops a stale local decode between Blob slices. */
   const transportAbortRef = useRef(null);
   /** Revoke the render loop's current frame request after an explicit seek. */
   const frameRequestRef = useRef(() => {});
@@ -134,8 +134,17 @@ export default function Viewer() {
     let frameGeneration = 0;
     let pendingFrame = null;
     const supersededFrames = new Set();
+    const contextInvalidatedFrames = new Set();
 
-    const invalidateFrame = () => {
+    const invalidateFrame = (preserveTimeoutAuthority = false) => {
+      if (preserveTimeoutAuthority) {
+        if (pendingFrame !== null) contextInvalidatedFrames.add(pendingFrame);
+        for (const token of supersededFrames) contextInvalidatedFrames.add(token);
+        supersededFrames.clear();
+      } else {
+        supersededFrames.clear();
+        contextInvalidatedFrames.clear();
+      }
       frameGeneration += 1;
       pendingFrame = null;
     };
@@ -153,8 +162,9 @@ export default function Viewer() {
     };
     const releaseFrame = (token) => {
       const wasSuperseded = supersededFrames.delete(token);
+      const wasContextInvalidated = contextInvalidatedFrames.delete(token);
       if (pendingFrame === token) pendingFrame = null;
-      return wasSuperseded;
+      return { wasSuperseded, wasContextInvalidated };
     };
     const supersedeFrame = () => {
       // IReadable has no cancellation contract. Permit one replacement request for
@@ -179,11 +189,19 @@ export default function Viewer() {
     };
     const frameIsCurrent = (token) =>
       token.generation === frameGeneration && frameBelongsToCurrentPlayable(token);
-    const frameFailureIsCurrent = (token, failure, wasSuperseded) =>
+    const frameBelongsToCurrentOpen = (token) => {
+      const playback = playbackRef.current;
+      return (
+        running &&
+        playback.serial === token.serial &&
+        playback.playable === token.playable
+      );
+    };
+    const frameFailureIsCurrent = (token, failure, release) =>
       frameIsCurrent(token) ||
       (failure instanceof ViewerLimitError &&
-        wasSuperseded &&
-        frameBelongsToCurrentPlayable(token));
+        ((release.wasSuperseded && frameBelongsToCurrentPlayable(token)) ||
+          (release.wasContextInvalidated && frameBelongsToCurrentOpen(token))));
 
     const contextLost = (event) => {
       // Prevent the default so the platform is allowed to restore the context. Until then,
@@ -197,9 +215,10 @@ export default function Viewer() {
       const playback = playbackRef.current;
       playback.playing = false;
       playback.rendered = undefined;
-      // A read started for the lost renderer no longer owns the pending slot. It may
-      // never settle, and even if it does its generation must keep it off the new GPU.
-      invalidateFrame();
+      // Reads for the lost renderer cannot publish, but their liveness verdict still owns
+      // this playable. If an uncancellable range times out after restoration, retiring it
+      // prevents repeated context-loss cycles from accumulating stranded transports.
+      invalidateFrame(true);
       renderer.clear();
       setPlaying(false);
       setSetupFailed(true);
@@ -265,10 +284,10 @@ export default function Viewer() {
           targetRenderer.setFrame(frame);
           current.rendered = wanted;
         } catch (failure) {
-          const wasSuperseded = releaseFrame(token);
+          const release = releaseFrame(token);
           const current = playbackRef.current;
           if (
-            !frameFailureIsCurrent(token, failure, wasSuperseded) ||
+            !frameFailureIsCurrent(token, failure, release) ||
             (current.time !== wanted && !(failure instanceof ViewerLimitError))
           )
             return;
@@ -277,7 +296,7 @@ export default function Viewer() {
           setPlaying(false);
           setDecodeFailed(true);
           fileFailureRef.current = failure;
-          setError(failure);
+          setError(setupFailureRef.current ?? failure);
         }
       }
     };
@@ -332,15 +351,15 @@ export default function Viewer() {
               targetRenderer.setFrame(frame);
             })
             .catch((failure) => {
-              const wasSuperseded = releaseFrame(token);
+              const release = releaseFrame(token);
               const current = playbackRef.current;
               // A fulfilled old instant is stale after a coalesced seek. A timeout from
               // either the superseded request or its replacement is different: that
               // uncancellable transport remains stranded, so ignoring it would allow
               // later scrubs to accumulate more. Retire the playable whatever time is
-              // now wanted; `wasSuperseded` preserves the old token's authority.
+              // now wanted; the release disposition preserves the old token's authority.
               if (
-                !frameFailureIsCurrent(token, failure, wasSuperseded) ||
+                !frameFailureIsCurrent(token, failure, release) ||
                 (current.time !== wanted && !(failure instanceof ViewerLimitError))
               )
                 return;
@@ -350,20 +369,35 @@ export default function Viewer() {
               setPlaying(false);
               setDecodeFailed(true);
               fileFailureRef.current = failure;
-              setError(failure);
+              setError(setupFailureRef.current ?? failure);
             });
         }
       }
 
-      renderer.draw(cameraRef.current);
+      try {
+        renderer.draw(cameraRef.current);
+      } catch (failure) {
+        // WebGL transfer calls report resource failures through getError rather than by
+        // throwing. The renderer translates those verdicts; retire the scene here so an
+        // animation-frame exception cannot leave stale GPU data labelled as current.
+        playback.playable = null;
+        playback.playing = false;
+        renderer.clear();
+        setPlaying(false);
+        setDecodeFailed(true);
+        fileFailureRef.current = failure;
+        setError(failure);
+      }
 
       if (now - lastReadout > READOUT_INTERVAL) {
         lastReadout = now;
+        const displayedPlayable = playback.playable;
         setReadout({
           time: playback.time,
           count: renderer.count,
-          intervals: playable === null ? [] : playable.intervalsAt(playback.time),
-          transfer: playable === null ? null : playable.transfer(),
+          intervals:
+            displayedPlayable === null ? [] : displayedPlayable.intervalsAt(playback.time),
+          transfer: displayedPlayable === null ? null : displayedPlayable.transfer(),
         });
       }
       requestAnimationFrame(tick);

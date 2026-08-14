@@ -409,8 +409,22 @@ export class SplatRenderer {
     // Ascending camera-space z is farthest first, which is the order "over" wants.
     order.subarray(0, visible).sort((a, b) => depths[a] - depths[b]);
     const gl = this.gl;
+    while (gl.getError() !== gl.NO_ERROR) {
+      // Attribute the following verdict to this upload, not to an older WebGL call.
+    }
     gl.bindBuffer(gl.ARRAY_BUFFER, this.indexBuffer);
     gl.bufferData(gl.ARRAY_BUFFER, order.subarray(0, visible), gl.DYNAMIC_DRAW);
+    const uploadError = gl.getError();
+    if (uploadError !== gl.NO_ERROR) {
+      const why =
+        uploadError === gl.OUT_OF_MEMORY
+          ? "the device reported OUT_OF_MEMORY"
+          : `WebGL reported error 0x${uploadError.toString(16)}`;
+      throw new RendererCapabilityError(
+        `WebGL2 could not upload sort indices for ${visible} visible gaussians: ${why}. ` +
+          "The file is fine, but this page does not have enough available GPU capacity.",
+      );
+    }
     return visible;
   }
 
@@ -429,9 +443,6 @@ export class SplatRenderer {
     ) {
       return;
     }
-    this.colouredForFrame = this.frameSerial;
-    this.colouredForCamera = cameraVersion;
-
     const colours = this.colourData;
     const rgb = [0, 0, 0];
     for (let i = 0; i < frame.count; i++) {
@@ -447,6 +458,9 @@ export class SplatRenderer {
 
     const gl = this.gl;
     const { width, rows } = rowsFor(this.colourLayout, frame.count);
+    while (gl.getError() !== gl.NO_ERROR) {
+      // Attribute the following verdict to this upload, not to an older WebGL call.
+    }
     gl.bindTexture(gl.TEXTURE_2D, this.colourTexture);
     gl.texSubImage2D(
       gl.TEXTURE_2D,
@@ -459,6 +473,20 @@ export class SplatRenderer {
       gl.UNSIGNED_BYTE,
       colours.subarray(0, rows * width * 4),
     );
+    const uploadError = gl.getError();
+    if (uploadError !== gl.NO_ERROR) {
+      const why =
+        uploadError === gl.OUT_OF_MEMORY
+          ? "the device reported OUT_OF_MEMORY"
+          : `WebGL reported error 0x${uploadError.toString(16)}`;
+      throw new RendererCapabilityError(
+        `WebGL2 could not upload colours for ${frame.count} live gaussians: ${why}. ` +
+          "The colour state was not marked current; the file is fine, but this page does " +
+          "not have enough available GPU capacity.",
+      );
+    }
+    this.colouredForFrame = this.frameSerial;
+    this.colouredForCamera = cameraVersion;
   }
 
   /** Grow the staging arrays and the textures. They never shrink. */
