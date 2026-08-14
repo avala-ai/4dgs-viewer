@@ -164,6 +164,39 @@ const failTextureAllocationCalls = (count) => `
   })();
 `;
 
+/** Fail CPU staging after candidate textures exist, and record their cleanup. */
+const FAIL_TEXTURE_STAGING = `
+  (() => {
+    const RealFloat32Array = globalThis.Float32Array;
+    const realDelete = WebGL2RenderingContext.prototype.deleteTexture;
+    globalThis.__viewerStagingFailureEnabled = true;
+    globalThis.__viewerTexturesCreated = 0;
+    globalThis.__viewerTexturesDeleted = 0;
+    const realCreate = WebGL2RenderingContext.prototype.createTexture;
+    WebGL2RenderingContext.prototype.createTexture = function () {
+      globalThis.__viewerTexturesCreated += 1;
+      return realCreate.call(this);
+    };
+    WebGL2RenderingContext.prototype.deleteTexture = function (texture) {
+      globalThis.__viewerTexturesDeleted += 1;
+      return realDelete.call(this, texture);
+    };
+    globalThis.Float32Array = new Proxy(RealFloat32Array, {
+      construct(target, args, receiver) {
+        if (
+          globalThis.__viewerStagingFailureEnabled &&
+          globalThis.__viewerTexturesCreated >= 4 &&
+          typeof args[0] === "number" &&
+          args[0] > 0
+        ) {
+          throw new RangeError("test staging allocation limit");
+        }
+        return Reflect.construct(target, args, receiver);
+      },
+    });
+  })();
+`;
+
 /** Advertise a small viewport ceiling and record any call that violates it. */
 const forceViewportLimit = (width, height) => `
   (() => {
@@ -739,6 +772,32 @@ describe("the viewer in a browser", { skip: available ? false : "no Chrome found
     await page.waitFor(opened, { what: "the scene after retrying texture allocation" });
     const retried = await page.evaluate(readState);
     assert.equal(retried.refusalTitle, null);
+    await page.close();
+  });
+
+  it("releases candidate textures when CPU staging allocation fails", async () => {
+    const page = await viewer(FAIL_TEXTURE_STAGING);
+    await page.evaluate(pickFile, `${site.base}/corpus/${VALID}`);
+    await page.waitFor(refused, { what: "the CPU staging-allocation refusal" });
+    const failed = await page.evaluate(readState);
+    assert.equal(failed.refusalTitle, "RendererCapabilityError");
+    assert.match(failed.refusalBody, /CPU staging memory/);
+    assert.match(failed.refusalBody, /test staging allocation limit/);
+    assert.deepEqual(
+      await page.evaluate(() => ({
+        created: globalThis.__viewerTexturesCreated,
+        deleted: globalThis.__viewerTexturesDeleted,
+      })),
+      { created: 6, deleted: 4 },
+      "both speculative and exact-retry candidate pairs must be released",
+    );
+
+    await page.evaluate(() => {
+      globalThis.__viewerStagingFailureEnabled = false;
+      return true;
+    });
+    await page.evaluate(pickFile, `${site.base}/corpus/${VALID}`);
+    await page.waitFor(opened, { what: "the scene after retrying CPU staging allocation" });
     await page.close();
   });
 

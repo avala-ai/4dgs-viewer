@@ -466,12 +466,19 @@ export class SplatRenderer {
     );
     const gl = this.gl;
     let allocation = allocateCapacity(gl, capacity, limit);
-    if (allocation.error !== gl.NO_ERROR && capacity !== count) {
+    if ((allocation.error !== gl.NO_ERROR || allocation.stagingError) && capacity !== count) {
       // Growth is speculative. A device that cannot reserve the doubled headroom may
       // still be perfectly capable of drawing this requested frame, so retry exactly it
       // before turning a memory-pressure signal into a capability refusal.
       capacity = count;
       allocation = allocateCapacity(gl, capacity, limit);
+    }
+    if (allocation.stagingError) {
+      throw new RendererCapabilityError(
+        `This browser could not allocate CPU staging memory for ${capacity} live gaussians: ` +
+          `${allocation.stagingError.message}. The candidate GPU textures were released; ` +
+          "the file is fine, but this page does not have enough available memory.",
+      );
     }
     if (allocation.error !== gl.NO_ERROR) {
       const why =
@@ -545,12 +552,26 @@ function allocateCapacity(gl, capacity, limit) {
   // Allocate CPU staging only after the device accepted the matching textures. In
   // particular, a rejected speculative growth does not remain live during its retry.
   // Whole rows ensure a partial `texSubImage2D` has every byte it declares.
-  const geometryData = new Float32Array(geometryLayout.texels * 4);
-  const colourData = new Uint8Array(colourLayout.texels * 4);
-  const depths = new Float32Array(capacity);
-  const order = new Uint32Array(capacity);
+  let geometryData;
+  let colourData;
+  let depths;
+  let order;
+  try {
+    geometryData = new Float32Array(geometryLayout.texels * 4);
+    colourData = new Uint8Array(colourLayout.texels * 4);
+    depths = new Float32Array(capacity);
+    order = new Uint32Array(capacity);
+  } catch (stagingError) {
+    // Texture allocation and JS heap allocation are one transaction. A typed-array
+    // RangeError must not strand the already-accepted GPU candidates or escape as though
+    // the file were malformed.
+    gl.deleteTexture(geometryTexture);
+    gl.deleteTexture(colourTexture);
+    return { error: gl.NO_ERROR, stagingError };
+  }
   return {
     error,
+    stagingError: null,
     geometryTexture,
     colourTexture,
     geometryLayout,
