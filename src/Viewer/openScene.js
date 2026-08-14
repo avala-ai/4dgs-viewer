@@ -817,10 +817,10 @@ function indexedKeyframePlayable(decoder, source, statistics) {
 /**
  * Whether the tail claims to be a complete file rather than coincidental payload magic.
  *
- * An actual Footer opcode corroborated by either fixed field makes the claim. If the
- * opcode itself is damaged, fixed length plus magic are not enough — arbitrary private
- * payload can contain both. In that case the decoded Footer content must point to a
- * bounded, structurally framed Chunk Index summary ending exactly at this tail boundary.
+ * An actual Footer opcode plus its fixed content length makes the claim even when terminal
+ * magic is damaged. Every other two-signal combination can occur in arbitrary private
+ * payload, so the decoded Footer content must also point to a bounded, structurally framed
+ * Chunk Index summary ending exactly at this tail boundary.
  */
 async function claimsTerminalFooter(source, size) {
   if (size < FOOTER_TAIL_BYTES) return false;
@@ -832,8 +832,12 @@ async function claimsTerminalFooter(source, size) {
     new DataView(tail.buffer, tail.byteOffset, tail.byteLength).getBigUint64(1, true) ===
     BigInt(FOOTER_TAIL_BYTES - RECORD_HEADER_BYTES - MAGIC.length);
   const magic = endsWithMagic(tail);
-  if (opcode) return contentLength || magic;
-  return contentLength && magic && (await hasKeyframeSummaryBoundary(source, offset, tail));
+  if (opcode && contentLength) return true;
+  return (
+    magic &&
+    (opcode || contentLength) &&
+    (await hasKeyframeSummaryBoundary(source, offset, tail))
+  );
 }
 
 function endsWithMagic(data) {

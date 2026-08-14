@@ -197,6 +197,34 @@ const FAIL_TEXTURE_STAGING = `
   })();
 `;
 
+/** Make the next floating-point texture upload report WebGL OUT_OF_MEMORY. */
+const FAIL_GEOMETRY_UPLOAD = `
+  (() => {
+    const realUpload = WebGL2RenderingContext.prototype.texSubImage2D;
+    const realError = WebGL2RenderingContext.prototype.getError;
+    globalThis.__viewerGeometryUploadFailureEnabled = true;
+    globalThis.__viewerGeometryUploadFailures = 0;
+    let error = 0;
+    WebGL2RenderingContext.prototype.texSubImage2D = function (...args) {
+      if (globalThis.__viewerGeometryUploadFailureEnabled && args[7] === this.FLOAT) {
+        globalThis.__viewerGeometryUploadFailureEnabled = false;
+        globalThis.__viewerGeometryUploadFailures += 1;
+        error = this.OUT_OF_MEMORY;
+        return;
+      }
+      return realUpload.apply(this, args);
+    };
+    WebGL2RenderingContext.prototype.getError = function () {
+      if (error !== 0) {
+        const result = error;
+        error = 0;
+        return result;
+      }
+      return realError.call(this);
+    };
+  })();
+`;
+
 /** Advertise a small viewport ceiling and record any call that violates it. */
 const forceViewportLimit = (width, height) => `
   (() => {
@@ -222,12 +250,19 @@ const CONTROL_BLOB_READ = `
     const real = Blob.prototype.arrayBuffer;
     globalThis.__holdViewerBlobRead = false;
     globalThis.__viewerBlobReadHeld = 0;
+    globalThis.__viewerBlobReads = 0;
+    globalThis.__releaseViewerBlobRead = null;
     globalThis.__rejectViewerBlobRead = null;
     Blob.prototype.arrayBuffer = function () {
+      globalThis.__viewerBlobReads += 1;
       if (!globalThis.__holdViewerBlobRead) return real.call(this);
       globalThis.__holdViewerBlobRead = false;
       globalThis.__viewerBlobReadHeld += 1;
       return new Promise((resolve, reject) => {
+        globalThis.__releaseViewerBlobRead = () => {
+          globalThis.__releaseViewerBlobRead = null;
+          resolve(real.call(this));
+        };
         globalThis.__rejectViewerBlobRead = () => {
           globalThis.__rejectViewerBlobRead = null;
           reject(new Error("the held local-file read failed for the test"));
@@ -801,6 +836,25 @@ describe("the viewer in a browser", { skip: available ? false : "no Chrome found
     await page.close();
   });
 
+  it("refuses a failed geometry upload before publishing the frame", async () => {
+    const page = await viewer(FAIL_GEOMETRY_UPLOAD);
+    await page.evaluate(pickFile, `${site.base}/corpus/${VALID}`);
+    await page.waitFor(refused, { what: "the geometry-upload refusal" });
+    const failed = await page.evaluate(readState);
+    assert.equal(failed.refusalTitle, "RendererCapabilityError");
+    assert.match(failed.refusalBody, /could not upload geometry/);
+    assert.match(failed.refusalBody, /OUT_OF_MEMORY/);
+    assert.match(failed.refusalBody, /frame was not published/i);
+    assert.equal(await page.evaluate(() => globalThis.__viewerGeometryUploadFailures), 1);
+    assert.equal(failed.playDisabled, true);
+
+    // The failed frame did not become the renderer's accepted state. A fresh selection
+    // has to upload it again and reach the ordinary playable view.
+    await page.evaluate(pickFile, `${site.base}/corpus/${VALID}`);
+    await page.waitFor(opened, { what: "the scene after retrying geometry upload" });
+    await page.close();
+  });
+
   it("keeps the drawing buffer and viewport within the device limit", async () => {
     const maximum = { width: 128, height: 64 };
     const page = await viewer(
@@ -893,6 +947,41 @@ describe("the viewer in a browser", { skip: available ? false : "no Chrome found
     assert.match(afterFileFailure.refusalBody, /WebGL2 context was lost/);
     assert.doesNotMatch(afterFileFailure.refusalBody, /held local-file read failed/);
     assert.equal(afterFileFailure.fileDisabled, true);
+    await page.close();
+  });
+
+  it("stops a superseded local-file decode after its current slice", async () => {
+    const page = await viewer(CONTROL_BLOB_READ);
+    await page.evaluate(() => {
+      globalThis.__holdViewerBlobRead = true;
+      return true;
+    });
+    await page.evaluate(pickFile, `${site.base}/corpus/${MULTI_CHUNK}`);
+    await page.waitFor(() => globalThis.__viewerBlobReadHeld === 1, {
+      what: "the superseded local-file slice",
+    });
+
+    // The new selection aborts the stale wrapper and opens independently even though the
+    // browser operation for the old slice has not settled.
+    await page.evaluate(pickFile, `${site.base}/corpus/${VALID}`);
+    await page.waitFor(opened, { what: "the replacement local file" });
+    const readsBeforeRelease = await page.evaluate(() => globalThis.__viewerBlobReads);
+    await page.evaluate(() => {
+      globalThis.__releaseViewerBlobRead();
+      return true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    assert.equal(
+      await page.evaluate(() => globalThis.__viewerBlobReads),
+      readsBeforeRelease,
+      "the obsolete decode must not start another Blob slice after its held read returns",
+    );
+    const state = await page.evaluate(readState);
+    assert.ok(
+      state.sources.some((source) => source.includes(VALID)),
+      `replacement source is absent from ${JSON.stringify(state.sources)}`,
+    );
+    assert.equal(state.refusalTitle, null);
     await page.close();
   });
 
@@ -1000,6 +1089,43 @@ describe("the viewer in a browser", { skip: available ? false : "no Chrome found
       2,
       "an authoritative replacement timeout must not start a third stranded range",
     );
+    await page.close();
+  });
+
+  it("retires a scene when a superseded range times out after its replacement succeeds", async () => {
+    const page = await viewer(CONTROL_NEXT_RANGE, SHORTEN_FRAME_TIMEOUT);
+    await page.evaluate(openUrl, `${site.base}/range/${MULTI_CHUNK}`);
+    await page.waitFor(opened, { what: "the URL-backed scene" });
+    await page.evaluate(() => {
+      globalThis.__shortenViewerFrameTimeout = true;
+      globalThis.__viewerShortFrameTimeoutMs = 1000;
+      globalThis.__nextViewerRange = "hang";
+      return true;
+    });
+    await page.evaluate(seekFraction, 0.75);
+    await page.waitFor(() => globalThis.__viewerRangeHung === 1, {
+      what: "the range that will be superseded",
+    });
+    await page.evaluate(seekFraction, 0.25);
+    await page.waitFor(
+      () => {
+        const live = [...document.querySelectorAll("dt")].find(
+          (entry) => entry.textContent === "Live at this instant",
+        );
+        return Number(live?.nextElementSibling?.textContent.replace(/,/g, "")) === 19;
+      },
+      { what: "the successful replacement frame" },
+    );
+
+    await page.waitFor(
+      () => document.querySelector("pre")?.textContent.includes("did not settle within 15 seconds"),
+      { what: "the superseded transport's authoritative timeout" },
+    );
+    const state = await page.evaluate(readState);
+    assert.equal(state.refusalTitle, "ViewerLimitError");
+    assert.equal(state.playDisabled, true);
+    assert.equal(state.scrubDisabled, true);
+    assert.equal(await page.evaluate(() => globalThis.__viewerRangeHung), 1);
     await page.close();
   });
 

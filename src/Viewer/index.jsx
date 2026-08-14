@@ -152,8 +152,9 @@ export default function Viewer() {
       return token;
     };
     const releaseFrame = (token) => {
-      supersededFrames.delete(token);
+      const wasSuperseded = supersededFrames.delete(token);
       if (pendingFrame === token) pendingFrame = null;
+      return wasSuperseded;
     };
     const supersedeFrame = () => {
       // IReadable has no cancellation contract. Permit one replacement request for
@@ -166,17 +167,23 @@ export default function Viewer() {
       pendingFrame = null;
     };
     frameRequestRef.current = supersedeFrame;
-    const frameIsCurrent = (token) => {
+    const frameBelongsToCurrentPlayable = (token) => {
       const playback = playbackRef.current;
       return (
         running &&
         !contextIsLost &&
-        token.generation === frameGeneration &&
         playback.serial === token.serial &&
         playback.playable === token.playable &&
         renderer === token.renderer
       );
     };
+    const frameIsCurrent = (token) =>
+      token.generation === frameGeneration && frameBelongsToCurrentPlayable(token);
+    const frameFailureIsCurrent = (token, failure, wasSuperseded) =>
+      frameIsCurrent(token) ||
+      (failure instanceof ViewerLimitError &&
+        wasSuperseded &&
+        frameBelongsToCurrentPlayable(token));
 
     const contextLost = (event) => {
       // Prevent the default so the platform is allowed to restore the context. Until then,
@@ -258,10 +265,10 @@ export default function Viewer() {
           targetRenderer.setFrame(frame);
           current.rendered = wanted;
         } catch (failure) {
-          releaseFrame(token);
+          const wasSuperseded = releaseFrame(token);
           const current = playbackRef.current;
           if (
-            !frameIsCurrent(token) ||
+            !frameFailureIsCurrent(token, failure, wasSuperseded) ||
             (current.time !== wanted && !(failure instanceof ViewerLimitError))
           )
             return;
@@ -325,14 +332,15 @@ export default function Viewer() {
               targetRenderer.setFrame(frame);
             })
             .catch((failure) => {
-              releaseFrame(token);
+              const wasSuperseded = releaseFrame(token);
               const current = playbackRef.current;
               // A fulfilled old instant is stale after a coalesced seek. A timeout from
-              // the current-generation replacement is different: its uncancellable
-              // transport remains stranded, so ignoring it would let the next tick add
-              // another stranded range. Retire the playable whatever time is now wanted.
+              // either the superseded request or its replacement is different: that
+              // uncancellable transport remains stranded, so ignoring it would allow
+              // later scrubs to accumulate more. Retire the playable whatever time is
+              // now wanted; `wasSuperseded` preserves the old token's authority.
               if (
-                !frameIsCurrent(token) ||
+                !frameFailureIsCurrent(token, failure, wasSuperseded) ||
                 (current.time !== wanted && !(failure instanceof ViewerLimitError))
               )
                 return;
@@ -476,7 +484,12 @@ export default function Viewer() {
   const openFile = useCallback(
     (file) => {
       if (file === undefined || file === null) return;
-      open(new BlobReadable(file), `${file.name} — ${formatBytes(file.size)}, read in this page`);
+      const transportAbort = new AbortController();
+      open(
+        new AbortableReadable(new BlobReadable(file), transportAbort.signal),
+        `${file.name} — ${formatBytes(file.size)}, read in this page`,
+        transportAbort,
+      );
     },
     [open],
   );
@@ -721,15 +734,15 @@ export default function Viewer() {
   );
 }
 
-/** Bound remote opening and abort its underlying fetch before publishing the diagnosis. */
+/** Bound opening and abort its underlying range or local-slice wrapper before refusing. */
 async function openingWithin(operation, transportAbort, timeoutMs) {
   if (transportAbort === null) return await operation;
   let timer;
   const timeout = new Promise((_, reject) => {
     timer = setTimeout(() => {
       const failure = new ViewerLimitError(
-        `remote scene opening did not settle within ${timeoutMs / 1000} seconds; ` +
-          "the request was cancelled instead of leaving this page busy indefinitely",
+        `scene opening did not settle within ${timeoutMs / 1000} seconds; ` +
+          "its reads were cancelled instead of leaving this page busy indefinitely",
       );
       transportAbort.abort(failure);
       reject(failure);
@@ -739,6 +752,50 @@ async function openingWithin(operation, transportAbort, timeoutMs) {
     return await Promise.race([operation, timeout]);
   } finally {
     clearTimeout(timer);
+  }
+}
+
+/**
+ * Stop a superseded local decode at its current bounded slice.
+ *
+ * `BlobReadable` has no cancellation contract, so the browser may still finish the one
+ * `Blob.arrayBuffer()` already in progress. Racing every operation against the open's
+ * signal prevents that obsolete result from entering the decoder, retaining its chunks,
+ * or starting another slice. Repeated file selections therefore cannot leave several
+ * full front-to-back decodes running behind the scene the visitor selected last.
+ */
+class AbortableReadable {
+  constructor(readable, signal) {
+    this.readable = readable;
+    this.signal = signal;
+  }
+
+  size() {
+    return withinAbort(this.signal, () => this.readable.size());
+  }
+
+  read(offset, length) {
+    return withinAbort(this.signal, () => this.readable.read(offset, length));
+  }
+}
+
+async function withinAbort(signal, operation) {
+  if (signal.aborted) throw signal.reason;
+  let onAbort;
+  const cancelled = new Promise((_, reject) => {
+    onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  // Recheck in the work microtask: an abort between the first check and starting the
+  // underlying operation must not begin another obsolete Blob slice.
+  const work = Promise.resolve().then(() => {
+    if (signal.aborted) throw signal.reason;
+    return operation();
+  });
+  try {
+    return await Promise.race([work, cancelled]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
   }
 }
 

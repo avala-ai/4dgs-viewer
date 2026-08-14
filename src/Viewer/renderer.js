@@ -281,6 +281,9 @@ export class SplatRenderer {
 
     const gl = this.gl;
     const { width, rows } = rowsFor(this.geometryLayout, frame.count * 3);
+    while (gl.getError() !== gl.NO_ERROR) {
+      // Attribute the following verdict to this upload, not to an older WebGL call.
+    }
     gl.bindTexture(gl.TEXTURE_2D, this.geometryTexture);
     gl.texSubImage2D(
       gl.TEXTURE_2D,
@@ -293,6 +296,18 @@ export class SplatRenderer {
       gl.FLOAT,
       geometry.subarray(0, rows * width * 4),
     );
+    const uploadError = gl.getError();
+    if (uploadError !== gl.NO_ERROR) {
+      const why =
+        uploadError === gl.OUT_OF_MEMORY
+          ? "the device reported OUT_OF_MEMORY"
+          : `WebGL reported error 0x${uploadError.toString(16)}`;
+      throw new RendererCapabilityError(
+        `WebGL2 could not upload geometry for ${frame.count} live gaussians: ${why}. ` +
+          "The frame was not published; the file is fine, but this page does not have " +
+          "enough available GPU capacity.",
+      );
+    }
     this.frame = frame;
     this.frameSerial += 1;
   }

@@ -52,6 +52,7 @@ import {
   appendPrivateRecordEndingMagic,
   appendPrivateRecordWithFooterByte,
   appendPrivateRecordWithFooterLengthAndMagic,
+  appendPrivateRecordWithFooterOpcodeAndMagic,
   cutAfterChunk,
   withBadSummaryCrc,
   withCorruptTerminalFooter,
@@ -840,6 +841,27 @@ describe("§11.10: a keyframe-delta timeline ends where its chunks do", () => {
     const tail = bytes.subarray(bytes.length - FOOTER_TAIL_BYTES);
     assert.notEqual(tail[0], Opcode.Footer);
     assert.equal(
+      new DataView(tail.buffer, tail.byteOffset, tail.byteLength).getBigUint64(1, true),
+      BigInt(FOOTER_TAIL_BYTES - RECORD_HEADER_BYTES - MAGIC.length),
+    );
+    assert.deepEqual(tail.subarray(tail.length - MAGIC.length), MAGIC);
+
+    const playable = await openScene(new BytesReadable(bytes));
+    assert.equal(playable.readMode, "keyframe-delta");
+    assert.ok(
+      playable.notes.some((note) => note.includes("truncated keyframe-delta prefix")),
+      playable.notes.join("\n"),
+    );
+    assert.ok((await playable.frameAt(0)).count > 0);
+  });
+
+  it("does not mistake Footer opcode plus magic inside private payload for a Footer", async () => {
+    const whole = variant(source);
+    const cut = cutAfterChunk(whole.bytes, 1).bytes;
+    const bytes = appendPrivateRecordWithFooterOpcodeAndMagic(cut);
+    const tail = bytes.subarray(bytes.length - FOOTER_TAIL_BYTES);
+    assert.equal(tail[0], Opcode.Footer);
+    assert.notEqual(
       new DataView(tail.buffer, tail.byteOffset, tail.byteLength).getBigUint64(1, true),
       BigInt(FOOTER_TAIL_BYTES - RECORD_HEADER_BYTES - MAGIC.length),
     );
