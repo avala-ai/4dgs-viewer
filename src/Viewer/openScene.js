@@ -26,6 +26,7 @@ import {
   IndexedDecoder,
   KeyframeDeltaIndexedDecoder,
   MAGIC,
+  MAX_KEYFRAME_DELTA_SUMMARY_BYTES,
   MAX_SH_DEGREE,
   MalformedFile,
   Opcode,
@@ -816,10 +817,10 @@ function indexedKeyframePlayable(decoder, source, statistics) {
 /**
  * Whether the tail claims to be a complete file rather than coincidental payload magic.
  *
- * Two of the three fixed Footer signals make the claim. The indexed decoder then owns the
- * full structural verdict: one damaged opcode, length, or trailing marker is malformed.
- * A truncated prefix can coincidentally place any one byte or marker at the tail, so one
- * signal alone remains eligible for prefix recovery.
+ * An actual Footer opcode corroborated by either fixed field makes the claim. If the
+ * opcode itself is damaged, fixed length plus magic are not enough — arbitrary private
+ * payload can contain both. In that case the decoded Footer content must point to a
+ * bounded, structurally framed Chunk Index summary ending exactly at this tail boundary.
  */
 async function claimsTerminalFooter(source, size) {
   if (size < FOOTER_TAIL_BYTES) return false;
@@ -831,7 +832,8 @@ async function claimsTerminalFooter(source, size) {
     new DataView(tail.buffer, tail.byteOffset, tail.byteLength).getBigUint64(1, true) ===
     BigInt(FOOTER_TAIL_BYTES - RECORD_HEADER_BYTES - MAGIC.length);
   const magic = endsWithMagic(tail);
-  return Number(opcode) + Number(contentLength) + Number(magic) >= 2;
+  if (opcode) return contentLength || magic;
+  return contentLength && magic && (await hasKeyframeSummaryBoundary(source, offset, tail));
 }
 
 function endsWithMagic(data) {
@@ -839,6 +841,34 @@ function endsWithMagic(data) {
   for (let i = 0; i < MAGIC.length; i++)
     if (data[at + i] !== MAGIC[i]) return false;
   return true;
+}
+
+/** Corroborate a damaged Footer opcode by the bounded summary immediately before it. */
+async function hasKeyframeSummaryBoundary(source, footerOffset, tail) {
+  try {
+    const content = tail.subarray(
+      RECORD_HEADER_BYTES,
+      FOOTER_TAIL_BYTES - MAGIC.length,
+    );
+    const footer = parseFooter(content);
+    const summaryLength = footerOffset - footer.summaryStart;
+    if (
+      footer.summaryStart < MAGIC.length ||
+      summaryLength <= 0 ||
+      summaryLength > MAX_KEYFRAME_DELTA_SUMMARY_BYTES
+    )
+      return false;
+    const scanner = new FrontMatterScanner(source, footerOffset, HEAD_PROBE_BYTES);
+    let end = footer.summaryStart;
+    let hasIndex = false;
+    for await (const record of scanner.records(footer.summaryStart)) {
+      end = record.offset + record.totalLength;
+      hasIndex ||= record.opcode === Opcode.ChunkIndex;
+    }
+    return hasIndex && end === footerOffset;
+  } catch {
+    return false;
+  }
 }
 
 /**

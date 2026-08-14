@@ -422,6 +422,23 @@ export function appendPrivateRecordWithFooterByte(bytes) {
   return join([bytes, framed]);
 }
 
+/** Append private payload whose tail collides with Footer length and magic, but not opcode. */
+export function appendPrivateRecordWithFooterLengthAndMagic(bytes) {
+  const content = new Uint8Array(FOOTER_TAIL_BYTES);
+  content[0] = 0x80;
+  new DataView(content.buffer).setBigUint64(
+    1,
+    BigInt(FOOTER_TAIL_BYTES - RECORD_HEADER_BYTES - MAGIC.length),
+    true,
+  );
+  content.set(MAGIC, content.length - MAGIC.length);
+  const framed = new Uint8Array(RECORD_HEADER_BYTES + content.length);
+  framed[0] = 0x80;
+  new DataView(framed.buffer).setBigUint64(1, BigInt(content.length), true);
+  framed.set(content, RECORD_HEADER_BYTES);
+  return join([bytes, framed]);
+}
+
 /** Corrupt one of the two fields that identify the fixed terminal Footer record. */
 export function withCorruptTerminalFooter(bytes, field) {
   const out = bytes.slice();
