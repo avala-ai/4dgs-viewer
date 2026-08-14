@@ -9,6 +9,7 @@
 
 import {
   Cursor,
+  FOOTER_TAIL_BYTES,
   MAGIC,
   Opcode,
   RECORD_HEADER_BYTES,
@@ -403,6 +404,17 @@ export function appendPrivateRecordEndingMagic(bytes) {
   const content = new Uint8Array(4 + MAGIC.length);
   content.set([0xde, 0xad, 0xbe, 0xef]);
   content.set(MAGIC, 4);
+  const framed = new Uint8Array(RECORD_HEADER_BYTES + content.length);
+  framed[0] = 0x80;
+  new DataView(framed.buffer).setBigUint64(1, BigInt(content.length), true);
+  framed.set(content, RECORD_HEADER_BYTES);
+  return join([bytes, framed]);
+}
+
+/** Append a legal private record whose payload puts a lone Footer opcode at tail offset. */
+export function appendPrivateRecordWithFooterByte(bytes) {
+  const content = new Uint8Array(FOOTER_TAIL_BYTES);
+  content[0] = Opcode.Footer;
   const framed = new Uint8Array(RECORD_HEADER_BYTES + content.length);
   framed[0] = 0x80;
   new DataView(framed.buffer).setBigUint64(1, BigInt(content.length), true);

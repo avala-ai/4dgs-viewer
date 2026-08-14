@@ -34,7 +34,10 @@ import {
   checkMagic,
   decodeKeyframeDeltaStreamed,
   decodeScene,
+  parseFooter,
   parseHeader,
+  parseStatistics,
+  readRecord,
   stateAtWithObjects,
 } from "@4dgs/core";
 
@@ -64,6 +67,7 @@ import {
  * @typedef {object} Playable
  * @property {"indexed"|"streamed"|"keyframe-delta"} readMode
  * @property {object} header the decoded Header record
+ * @property {object|null} statistics the decoded Statistics record, when present
  * @property {number} duration seconds; the timeline is the half-open `[0, duration)`
  * @property {(t: number) => Promise<Frame>} frameAt
  * @property {(t: number) => {t0: number, t1: number}[]} intervalsAt chunks covering `t`
@@ -341,6 +345,7 @@ function indexedPlayable(decoder, source, notes) {
   return {
     readMode: "indexed",
     header,
+    statistics: decoder.statistics,
     duration: header.durationSec,
     // Every gaussian in the assembled set came from a chunk covering `t`, so §5.5's
     // "invisible outside its interval" is already satisfied by which chunks were read.
@@ -385,6 +390,7 @@ async function streamedPlayable(scene, source, size, notes, chunkGateTimeoutMs) 
   return {
     readMode: "streamed",
     header: scene.header,
+    statistics: scene.statistics,
     duration: scene.header.durationSec,
     frameAt: async (t) =>
       frameFromSet(scene.gaussians, scene.objects, t, cutoff, gate),
@@ -701,9 +707,11 @@ export function concatSh(chunks) {
  */
 async function openKeyframeDelta(source, size) {
   if (await claimsTerminalFooter(source, size)) {
+    const decoder = await KeyframeDeltaIndexedDecoder.open(source);
     return indexedKeyframePlayable(
-      await KeyframeDeltaIndexedDecoder.open(source),
+      decoder,
       source,
+      await statisticsFromSummary(source, size),
     );
   }
   if (size > KEYFRAME_DELTA_BYTE_LIMIT) {
@@ -757,6 +765,7 @@ async function openKeyframeDelta(source, size) {
   return {
     readMode: "keyframe-delta",
     header: sequence.header,
+    statistics: null,
     duration,
     frameAt: async (t) => {
       const chunk = covering(t);
@@ -779,7 +788,7 @@ async function openKeyframeDelta(source, size) {
   };
 }
 
-function indexedKeyframePlayable(decoder, source) {
+function indexedKeyframePlayable(decoder, source, statistics) {
   const { header, index } = decoder;
   const covering = (t) => {
     for (const entry of index) if (entry.t0 <= t && t < entry.t1) return entry;
@@ -788,6 +797,7 @@ function indexedKeyframePlayable(decoder, source) {
   return {
     readMode: "keyframe-delta",
     header,
+    statistics,
     duration: header.durationSec,
     frameAt: async (t) =>
       frameFromKeyframeState(await decoder.reconstructAt(t)),
@@ -806,29 +816,50 @@ function indexedKeyframePlayable(decoder, source) {
 /**
  * Whether the tail claims to be a complete file rather than coincidental payload magic.
  *
- * Either fixed Footer field is enough to make the claim. The indexed decoder then owns
- * the full structural verdict: an intact opcode with a bad length, or the fixed length
- * under a bad opcode, is malformed rather than a truncated prefix. Magic at the end of
- * unrelated record content has neither field and remains eligible for prefix recovery.
+ * Two of the three fixed Footer signals make the claim. The indexed decoder then owns the
+ * full structural verdict: one damaged opcode, length, or trailing marker is malformed.
+ * A truncated prefix can coincidentally place any one byte or marker at the tail, so one
+ * signal alone remains eligible for prefix recovery.
  */
 async function claimsTerminalFooter(source, size) {
   if (size < FOOTER_TAIL_BYTES) return false;
   const offset = size - FOOTER_TAIL_BYTES;
   const tail = await source.read(BigInt(offset), BigInt(FOOTER_TAIL_BYTES));
   if (tail.length !== FOOTER_TAIL_BYTES) return false;
-  try {
-    const cursor = new Cursor(tail, 0, offset);
-    const opcode = cursor.u8();
-    const contentLength = cursor.u64();
-    return (
-      opcode === Opcode.Footer ||
-      contentLength === FOOTER_TAIL_BYTES - RECORD_HEADER_BYTES - MAGIC.length
-    );
-  } catch {
-    // A Footer opcode whose length is not even representable is still a completeness
-    // claim, and the indexed decoder will name that malformed u64 precisely.
-    return tail[0] === Opcode.Footer;
+  const opcode = tail[0] === Opcode.Footer;
+  const contentLength =
+    new DataView(tail.buffer, tail.byteOffset, tail.byteLength).getBigUint64(1, true) ===
+    BigInt(FOOTER_TAIL_BYTES - RECORD_HEADER_BYTES - MAGIC.length);
+  const magic = endsWithMagic(tail);
+  return Number(opcode) + Number(contentLength) + Number(magic) >= 2;
+}
+
+function endsWithMagic(data) {
+  const at = data.length - MAGIC.length;
+  for (let i = 0; i < MAGIC.length; i++)
+    if (data[at + i] !== MAGIC[i]) return false;
+  return true;
+}
+
+/**
+ * Read the optional Statistics summary after the indexed keyframe decoder has validated it.
+ *
+ * The current SDK exposes Statistics on gaussian-birth readers but not on
+ * KeyframeDeltaIndexedDecoder. Walk the already-validated summary by record framing and
+ * fetch only the fixed 68-byte Statistics prefix, so sparse camera framing remains bounded.
+ */
+async function statisticsFromSummary(source, size) {
+  const footerOffset = size - FOOTER_TAIL_BYTES;
+  const tail = await source.read(BigInt(footerOffset), BigInt(FOOTER_TAIL_BYTES));
+  const footer = parseFooter(readRecord(new Cursor(tail, 0, footerOffset)).content);
+  if (footer.summaryStart <= 0 || footer.summaryStart >= footerOffset) return null;
+  const scanner = new FrontMatterScanner(source, footerOffset, HEAD_PROBE_BYTES);
+  let statistics = null;
+  for await (const record of scanner.records(footer.summaryStart)) {
+    if (record.opcode !== Opcode.Statistics) continue;
+    statistics = parseStatistics(await scanner.content(record, 68));
   }
+  return statistics;
 }
 
 function transferOf(source) {

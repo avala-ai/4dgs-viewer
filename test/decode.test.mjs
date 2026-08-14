@@ -16,9 +16,11 @@ import { describe, it } from "node:test";
 
 import {
   DEFAULT_CUTOFF,
+  FOOTER_TAIL_BYTES,
   FourdgsError,
   MAGIC,
   MalformedFile,
+  Opcode,
   RECORD_HEADER_BYTES,
   UnsupportedCodec,
   UnsupportedVersion,
@@ -48,6 +50,7 @@ import {
 } from "./support/corpus.mjs";
 import {
   appendPrivateRecordEndingMagic,
+  appendPrivateRecordWithFooterByte,
   cutAfterChunk,
   withBadSummaryCrc,
   withCorruptTerminalFooter,
@@ -115,6 +118,22 @@ describe("the corpus decodes to the same scene on both read paths", () => {
     );
   });
 
+  it("retains scene-wide Statistics on indexed and streamed playables", async () => {
+    const entry = GAUSSIAN_BIRTH.find(({ name }) =>
+      name.includes("UseStatistics"),
+    );
+    assert.ok(entry, "the corpus has no gaussian-birth Statistics variant");
+    const indexed = await openScene(new FileReadable(entry.file));
+    const streamed = await openScene(new NoFooterReadable(entry.file));
+    assert.deepEqual(streamed.statistics, indexed.statistics);
+    assert.equal(
+      indexed.statistics.gaussianCount,
+      Number(entry.expected.gaussianCount),
+    );
+    assert.equal(indexed.statistics.durationSec, entry.expected.durationSec);
+    assert.deepEqual(indexed.statistics.aabb.map(round), entry.expected.statistics.aabb);
+  });
+
   for (const entry of GAUSSIAN_BIRTH) {
     const { name, file, expected } = entry;
     it(name, async () => {
@@ -140,6 +159,11 @@ describe("the corpus decodes to the same scene on both read paths", () => {
         expected.gaussianCount,
       );
       assert.equal(indexed.header.shDegree, expected.shDegree);
+      assert.deepEqual(
+        streamed.statistics,
+        indexed.statistics,
+        "Statistics agree on both read paths",
+      );
 
       for (const t of instantsFor(indexed.duration)) {
         // §8's seek rule, against the intervals the expectation lists.
@@ -311,12 +335,12 @@ describe("camera framing survives asynchronous and sparse opens", () => {
     assert.deepEqual(installed.current, [empty]);
   });
 
-  it("falls back to the Header AABB when fixed probes miss sparse visibility", async () => {
+  it("falls back to the Statistics AABB when fixed probes miss sparse visibility", async () => {
     const probes = [];
     const framed = [];
     const playable = {
       duration: 1,
-      header: { aabb: [10, 20, 30, 14, 26, 38] },
+      statistics: { aabb: [10, 20, 30, 14, 26, 38] },
       frameAt: async (t) => {
         probes.push(t);
         return empty;
@@ -339,7 +363,7 @@ describe("camera framing survives asynchronous and sparse opens", () => {
     await frameCamera(
       {
         duration: 10,
-        header: { aabb: [-100, -100, -100, 100, 100, 100] },
+        statistics: { aabb: [-100, -100, -100, 100, 100, 100] },
         frameAt: async (t) => {
           probes.push(t);
           return frame;
@@ -352,13 +376,13 @@ describe("camera framing survives asynchronous and sparse opens", () => {
     assert.deepEqual(probes, [0]);
   });
 
-  it("bounds optional probes that never settle and opens with Header bounds", async () => {
+  it("bounds optional probes that never settle and opens with Statistics bounds", async () => {
     const probes = [];
     const framed = [];
     const warnings = await frameCamera(
       {
         duration: 1,
-        header: { aabb: [10, 20, 30, 14, 26, 38] },
+        statistics: { aabb: [10, 20, 30, 14, 26, 38] },
         frameAt: (t) => {
           probes.push(t);
           return t === 0 ? Promise.resolve(empty) : new Promise(() => {});
@@ -782,6 +806,25 @@ describe("§11.10: a keyframe-delta timeline ends where its chunks do", () => {
     assert.ok((await playable.frameAt(0)).count > 0);
   });
 
+  it("does not mistake a lone Footer opcode in truncated payload for a Footer", async () => {
+    const whole = variant(source);
+    const cut = cutAfterChunk(whole.bytes, 1).bytes;
+    const bytes = appendPrivateRecordWithFooterByte(cut);
+    assert.equal(
+      bytes[bytes.length - FOOTER_TAIL_BYTES],
+      Opcode.Footer,
+      "the private payload must put a Footer opcode at the fixed tail offset",
+    );
+
+    const playable = await openScene(new BytesReadable(bytes));
+    assert.equal(playable.readMode, "keyframe-delta");
+    assert.ok(
+      playable.notes.some((note) => note.includes("truncated keyframe-delta prefix")),
+      playable.notes.join("\n"),
+    );
+    assert.ok((await playable.frameAt(0)).count > 0);
+  });
+
   for (const field of ["opcode", "length"]) {
     it(`refuses a complete file whose terminal Footer ${field} is corrupt`, async () => {
       const bytes = withCorruptTerminalFooter(variant(source).bytes, field);
@@ -803,6 +846,19 @@ describe("§11.10: a keyframe-delta timeline ends where its chunks do", () => {
         error instanceof MalformedFile &&
         error.message.includes("does not end with the magic"),
     );
+  });
+
+  it("retains Statistics for a complete indexed keyframe scene", async () => {
+    const whole = variant(source);
+    const playable = await openScene(new BytesReadable(whole.bytes.slice()));
+    assert.equal(playable.readMode, "keyframe-delta");
+    assert.equal(
+      playable.statistics.gaussianCount,
+      Number(whole.expected.gaussianCount),
+    );
+    assert.equal(playable.statistics.durationSec, whole.expected.durationSec);
+    assert.equal(playable.statistics.aabb.length, 6);
+    assert.ok(playable.statistics.aabb.every(Number.isFinite));
   });
 
   it("storage order is not time order: coverage comes from the largest t1", async () => {

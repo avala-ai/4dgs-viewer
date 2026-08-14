@@ -45,7 +45,7 @@ export async function frameCamera(
       if (frame === PROBE_TIMED_OUT) {
         warnings.push(
           `t = ${t} camera framing probe did not answer within ${probeTimeoutMs} ms; ` +
-            "the scene opened using its Header bounds",
+            "the scene opened using its Statistics bounds",
         );
         break;
       }
@@ -62,9 +62,9 @@ export async function frameCamera(
   // caller marks zero rendered. Avoid a duplicate upload when the renderer is unchanged.
   const settledRenderer = currentRenderer();
   if (settledRenderer !== landingRenderer) settledRenderer?.setFrame(first);
-  // Fixed probes can all miss a narrow visibility interval. The Header AABB is scene-wide
+  // Fixed probes can all miss a narrow visibility interval. The Statistics AABB is scene-wide
   // and is therefore the authoritative fallback for a sparse but otherwise valid scene.
-  const framing = bounds ?? boundsFromAabb(playable.header?.aabb);
+  const framing = bounds ?? boundsFromAabb(playable.statistics?.aabb);
   camera.frame(
     framing === null ? [0, 0, 0] : framing.center,
     framing === null ? 1 : framing.radius,
