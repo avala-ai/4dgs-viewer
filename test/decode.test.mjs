@@ -35,7 +35,7 @@ import {
   frameAtWithin,
   openScene,
 } from "../src/Viewer/openScene.js";
-import { frameCamera } from "../src/Viewer/framing.js";
+import { boundsFromAabb, frameCamera } from "../src/Viewer/framing.js";
 import { reconstructKeyframeDelta } from "../src/Viewer/keyframeDelta.js";
 import {
   BytesReadable,
@@ -355,6 +355,13 @@ describe("camera framing survives asynchronous and sparse opens", () => {
     assert.deepEqual(probes, [0, 0.25, 0.5, 0.75, 0.999]);
     assert.deepEqual(framed[0].center, [12, 23, 34]);
     assert.equal(framed[0].radius, Math.hypot(4, 6, 8) / 2);
+  });
+
+  it("preserves the center of a zero-extent Statistics AABB", () => {
+    assert.deepEqual(boundsFromAabb([12, 23, 34, 12, 23, 34]), {
+      center: [12, 23, 34],
+      radius: 0,
+    });
   });
 
   it("does not fetch later instants once the landing frame has bounds", async () => {

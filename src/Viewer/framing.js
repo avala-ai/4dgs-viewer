@@ -92,7 +92,9 @@ export function boundsFromAabb(aabb) {
   if (!Array.isArray(aabb) || aabb.length !== 6 || !aabb.every(Number.isFinite)) return null;
   const center = [(aabb[0] + aabb[3]) / 2, (aabb[1] + aabb[4]) / 2, (aabb[2] + aabb[5]) / 2];
   const radius = Math.hypot(aabb[3] - aabb[0], aabb[4] - aabb[1], aabb[5] - aabb[2]) / 2;
-  if (!center.every(Number.isFinite) || !Number.isFinite(radius) || radius <= 0) return null;
+  // A single-position scene has an authoritative center and a zero extent. OrbitCamera
+  // already clamps that radius to its minimum useful viewing distance.
+  if (!center.every(Number.isFinite) || !Number.isFinite(radius)) return null;
   return { center, radius };
 }
 
