@@ -1,0 +1,901 @@
+/**
+ * Opening a `.4dgs` and asking it for the gaussians alive at an instant.
+ *
+ * Everything here is `@4dgs/core` driving; there is no second parser on this page. The
+ * only job of this module is to give the renderer one shape — a {@link Frame} — whichever
+ * of the format's three read paths produced it:
+ *
+ * - **indexed** (`gaussian-birth`, file carries a Chunk Index): the Footer, then the
+ *   index, then only the byte ranges whose `[t0, t1)` contains the instant on screen.
+ *   This is the seek path the format exists for, and it is the default.
+ * - **streamed** (`gaussian-birth`, no usable index): `decodeScene` walks the resource
+ *   front to back in bounded reads. Also the fallback for a truncated file, whose Footer
+ *   never arrived.
+ * - **keyframe-delta**: composition, then reconstruction at the instant.
+ *
+ * All three take an `IReadable`, so a local `File` (`BlobReadable`) and a pasted URL
+ * (`HttpRangeReadable`) are the same code from here down.
+ */
+
+import {
+  Cursor,
+  DEFAULT_CUTOFF,
+  FOOTER_TAIL_BYTES,
+  FrontMatterScanner,
+  HEAD_PROBE_BYTES,
+  IndexedDecoder,
+  KeyframeDeltaIndexedDecoder,
+  MAGIC,
+  MAX_KEYFRAME_DELTA_SUMMARY_BYTES,
+  MAX_SH_DEGREE,
+  MalformedFile,
+  Opcode,
+  RECORD_HEADER_BYTES,
+  assembleGaussians,
+  checkMagic,
+  decodeKeyframeDeltaStreamed,
+  decodeScene,
+  parseFooter,
+  parseHeader,
+  parseStatistics,
+  readRecord,
+  stateAtWithObjects,
+} from "@4dgs/core";
+
+import {
+  frameFromKeyframeState,
+  reconstructKeyframeDelta,
+} from "./keyframeDelta.js";
+
+/**
+ * The gaussians alive at one instant, in the layout the renderer uploads.
+ *
+ * @typedef {object} Frame
+ * @property {number} time scene time these values were reconstructed at
+ * @property {number} count how many gaussians exist at that time
+ * @property {Float32Array} centers `count × 3`
+ * @property {Float32Array} scales `count × 3`, linear
+ * @property {Float32Array} rotations `count × 4`, unit quaternion, xyzw
+ * @property {Float32Array} colors `count × 4`, linear RGB plus opacity at this instant
+ * @property {Uint8Array|null} sh `count × 3 × shCoefficients`, component-major, or null
+ * @property {number} shCoefficients coefficients per colour component
+ * @property {number} shDegree highest whole degree present
+ */
+
+/**
+ * A file the viewer can play.
+ *
+ * @typedef {object} Playable
+ * @property {"indexed"|"streamed"|"keyframe-delta"} readMode
+ * @property {object} header the decoded Header record
+ * @property {object|null} statistics the decoded Statistics record, when present
+ * @property {number} duration seconds; the timeline is the half-open `[0, duration)`
+ * @property {(t: number) => Promise<Frame>} frameAt
+ * @property {(t: number) => {t0: number, t1: number}[]} intervalsAt chunks covering `t`
+ * @property {() => {bytes: number, reads: number, size: number}} transfer
+ * @property {string[]} notes things worth saying about this particular file
+ */
+
+/**
+ * The largest Header record this page will fetch to learn the temporal model.
+ *
+ * Mirrors `MAX_FRONT_MATTER_BYTES` in `@4dgs/core`'s indexed reader, which is the ceiling
+ * that reader puts on a single front-matter record. It is not exported, so it is restated
+ * here rather than invented: a Header is framed by a `u64`, and a length field is not a
+ * reason to allocate.
+ */
+const MAX_HEADER_RECORD_BYTES = 64 * 1024 * 1024;
+
+/** Decoded chunks kept on the indexed path. Bounds the memory a long scrub can reach. */
+const CHUNK_CACHE_LIMIT = 64;
+
+/** Longest the optional streamed-index visibility check may delay a usable scene. */
+const CHUNK_GATE_TIMEOUT_MS = 1_500;
+
+const CHUNK_GATE_TIMED_OUT = Symbol("streamed Chunk Index check timed out");
+
+/**
+ * The largest truncated `keyframe-delta` prefix this page will read whole.
+ *
+ * Complete resources use `KeyframeDeltaIndexedDecoder` over `IReadable` and have no
+ * file-sized allocation. Prefix recovery necessarily uses `decodeKeyframeDeltaStreamed`,
+ * whose current API accepts a `Uint8Array`; refuse before allocating beyond this ceiling.
+ */
+const KEYFRAME_DELTA_BYTE_LIMIT = 512 * 1024 * 1024;
+
+/** A conforming resource this particular page cannot safely hold. */
+export class ViewerLimitError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "ViewerLimitError";
+  }
+}
+
+/** Longest one displayed-frame read may monopolize the viewer's pending slot. */
+export const FRAME_READ_TIMEOUT_MS = 15_000;
+
+/**
+ * Read one displayed frame with a fixed liveness bound.
+ *
+ * IReadable deliberately has no transport cancellation contract. The underlying operation
+ * may therefore settle later, but Promise.race owns no publication path: the render loop's
+ * token decides that separately, and a timeout retires this playable. This leaves at most
+ * one abandoned transport promise rather than starting a new one on every animation frame.
+ */
+export async function frameAtWithin(playable, wanted, timeoutMs = FRAME_READ_TIMEOUT_MS) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      reject(
+        new ViewerLimitError(
+          `frame at ${wanted} s did not settle within ${timeoutMs / 1000} seconds; ` +
+            "playback stopped rather than retaining an unbounded pending read",
+        ),
+      );
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([Promise.resolve().then(() => playable.frameAt(wanted)), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Counts what the transport actually moved.
+ *
+ * Only here so the page can show it: "opening this instant read 41 KiB of a 3.2 MiB file"
+ * is the claim the byte-range index makes, and a viewer is in a position to prove it
+ * rather than repeat it.
+ */
+class CountingReadable {
+  constructor(inner) {
+    this.inner = inner;
+    this.bytes = 0;
+    this.reads = 0;
+    this.total = 0;
+  }
+
+  async size() {
+    const size = await this.inner.size();
+    this.total = Number(size);
+    return size;
+  }
+
+  async read(offset, length) {
+    const bytes = await this.inner.read(offset, length);
+    this.bytes += bytes.byteLength;
+    this.reads += 1;
+    return bytes;
+  }
+}
+
+/**
+ * Open a resource and return something the transport control can play.
+ *
+ * Refusals are not caught here. A decoder that names the byte, the record and the value is
+ * the most useful thing this page has to say about a file that will not open, and wrapping
+ * it in "could not open this file" would throw that away.
+ */
+export async function openScene(
+  source,
+  { chunkGateTimeoutMs = CHUNK_GATE_TIMEOUT_MS } = {},
+) {
+  const counting = new CountingReadable(source);
+  const size = Number(await counting.size());
+  // Learn the temporal model before either decoder opens the file. In particular, this
+  // frames the Header and enforces the viewer's per-record ceiling before
+  // `IndexedDecoder.open` is allowed to fetch its content from an untrusted u64 length.
+  const temporalModel = await temporalModelOf(counting, size);
+  try {
+    return await openGaussianBirth(counting, size, chunkGateTimeoutMs);
+  } catch (refusal) {
+    // `decodeScene` and `IndexedDecoder` implement `gaussian-birth`, and they refuse
+    // anything else by name. A `keyframe-delta` file lands here.
+    if (temporalModel !== "keyframe-delta") throw refusal;
+    return await openKeyframeDelta(counting, size);
+  }
+}
+
+/**
+ * The Header's temporal model, from a bounded walk of the front.
+ *
+ * `FrontMatterScanner` is the same walk `IndexedDecoder.open` does: it steps records by
+ * their framed length, holding one window of `HEAD_PROBE_BYTES`, and fetches content only
+ * for the record asked for. That matters because the Header is not the only thing at the
+ * front of a file and it is not bounded by any probe size — a scene with a large
+ * attributes map has a Header record of whatever size it needs, and a fixed-size read that
+ * happens not to contain it would answer "not keyframe-delta" about a file that is one.
+ *
+ * `null` when the walk did not reach a Header, or when it could not be read at all — a
+ * short or malformed file, whose real refusal the decoder will supply. A framed Header
+ * beyond the viewer's ceiling is different: refuse it here before any decoder can turn
+ * its declared length into a range read.
+ */
+async function temporalModelOf(source, size) {
+  try {
+    const scanner = new FrontMatterScanner(source, size, HEAD_PROBE_BYTES);
+    checkMagic(await scanner.head(MAGIC.length));
+    for await (const record of scanner.records(MAGIC.length)) {
+      if (record.opcode !== Opcode.Header) continue;
+      if (record.contentLength > MAX_HEADER_RECORD_BYTES) {
+        throw new ViewerLimitError(
+          `Header record at byte ${record.offset} declares ${record.contentLength} content bytes; ` +
+            `this viewer limits a Header to ${MAX_HEADER_RECORD_BYTES} bytes before decoding it`,
+        );
+      }
+      return parseHeader(await scanner.content(record)).temporalModel;
+    }
+  } catch (error) {
+    if (error instanceof ViewerLimitError) throw error;
+    return null;
+  }
+  return null;
+}
+
+// --------------------------------------------------------------------------
+// gaussian-birth
+// --------------------------------------------------------------------------
+
+async function openGaussianBirth(source, size, chunkGateTimeoutMs) {
+  const notes = [];
+  try {
+    const decoder = await IndexedDecoder.open(source);
+    if (decoder.index.length > 0 && decoder.summaryCrcOk !== false) {
+      return indexedPlayable(decoder, source, notes);
+    }
+    if (decoder.summaryCrcOk === false) {
+      notes.push(
+        "The Footer's summary CRC does not match the index it covers, so the index is not " +
+          "trusted for seeking and the file is read front to back instead.",
+      );
+    } else {
+      notes.push(
+        "The file carries no Chunk Index, so it is read front to back instead of seeked.",
+      );
+    }
+  } catch (error) {
+    // An index that cannot be read is a reason to read the file the other way, not a
+    // reason to refuse it: a file cut before its Footer has no index and still decodes.
+    // If the streamed path refuses too, its diagnosis is the one that surfaces.
+    notes.push(`The indexed read path was not usable: ${error.message}`);
+  }
+  const scene = await decodeScene(source);
+  return await streamedPlayable(
+    scene,
+    source,
+    size,
+    notes,
+    chunkGateTimeoutMs,
+  );
+}
+
+/** The cutoff reconstruction actually applies when the Header carries the zero sentinel. */
+export function effectiveCutoff(header) {
+  return header.cutoff > 0 ? header.cutoff : DEFAULT_CUTOFF;
+}
+
+/** Seeked reads: for each instant, only the chunks whose `[t0, t1)` contains it. */
+function indexedPlayable(decoder, source, notes) {
+  const { header } = decoder;
+  const cutoff = effectiveCutoff(header);
+  const chunks = new Map();
+  let assembled = { key: null, set: null };
+  let objectsPromise = null;
+  let duplicateIndex = null;
+  const offsets = new Map();
+  for (let position = 0; position < decoder.index.length; position++) {
+    const entry = decoder.index[position];
+    const first = offsets.get(entry.chunkOffset);
+    if (first !== undefined) {
+      duplicateIndex = new MalformedFile(
+        `Chunk Index entries ${first} and ${position} both name chunk_offset ` +
+          `${entry.chunkOffset}; each physical Chunk may appear only once`,
+      );
+      break;
+    }
+    offsets.set(entry.chunkOffset, position);
+  }
+
+  // Object-layer records live outside Chunk ranges and are deliberately deferred by the
+  // indexed decoder. Fetch them only when the first frame is requested, then reuse the
+  // checked layer for every instant.
+  const objects = () => (objectsPromise ??= decoder.readObjects());
+
+  async function setFor(t) {
+    // Defer this file verdict until frameAt so IndexedDecoder.open remains an indexed
+    // success rather than letting openGaussianBirth reinterpret it as an absent index and
+    // silently fall back to streaming.
+    if (duplicateIndex !== null) throw duplicateIndex;
+    // The normative seek rule, and the whole of it. `chunksForTime` is `t0 <= t < t1`.
+    const entries = decoder.chunksForTime(t);
+    const key = entries.map((entry) => entry.chunkOffset).join(",");
+    if (assembled.key === key) return assembled.set;
+
+    const decoded = [];
+    for (const entry of entries) {
+      let chunk = chunks.get(entry.chunkOffset);
+      if (chunk === undefined) {
+        // Decode every physical band before comparing with the Header. Applying
+        // maxShBand first would make a degree-2 Chunk look like degree 1 and accept its
+        // undeclared extra records. The format's degree ceiling keeps this read bounded.
+        chunk = await decoder.readChunk(entry, { maxShBand: MAX_SH_DEGREE });
+        const decodedDegree = chunk.sh?.degree ?? 0;
+        if (chunk.gaussians.count > 0 && decodedDegree !== header.shDegree) {
+          throw new MalformedFile(
+            `Chunk at byte ${entry.chunkOffset} decodes SH degree ${decodedDegree}, ` +
+              `but the Header declares SH degree ${header.shDegree}`,
+          );
+        }
+        chunks.set(entry.chunkOffset, chunk);
+        if (chunks.size > CHUNK_CACHE_LIMIT)
+          chunks.delete(chunks.keys().next().value);
+      }
+      decoded.push(chunk);
+    }
+    const set = assembleGaussians(
+      decoded.map((chunk) => chunk.gaussians),
+      decoder.windows,
+      header.shDegree,
+      concatSh(decoded),
+    );
+    assembled = { key, set };
+    return set;
+  }
+
+  return {
+    readMode: "indexed",
+    header,
+    statistics: decoder.statistics,
+    duration: header.durationSec,
+    // Every gaussian in the assembled set came from a chunk covering `t`, so §5.5's
+    // "invisible outside its interval" is already satisfied by which chunks were read.
+    frameAt: async (t) =>
+      frameFromSet(await setFor(t), await objects(), t, cutoff, null),
+    intervalsAt: (t) =>
+      decoder.chunksForTime(t).map(({ t0, t1 }) => ({ t0, t1 })),
+    transfer: () => transferOf(source),
+    notes,
+  };
+}
+
+/** Front to back: the whole scene decoded once, then reconstructed at each instant. */
+async function streamedPlayable(scene, source, size, notes, chunkGateTimeoutMs) {
+  const cutoff = effectiveCutoff(scene.header);
+  const { gate, why } = await chunkGateOf(
+    scene,
+    source,
+    size,
+    chunkGateTimeoutMs,
+  );
+  if (gate === null) {
+    notes.push(
+      `${why} §5.5 says a chunk's gaussians are invisible outside its [t0, t1); a gaussian ` +
+        "whose validity window outlives its chunk therefore stays on screen after that chunk " +
+        "ends, where the indexed path would drop it. Every other visibility rule is applied.",
+    );
+  }
+  if (scene.truncated) {
+    notes.push(
+      "The resource ended before the file did. Everything decoded before the cut stands.",
+    );
+  }
+  if (scene.skippedOpcodes.length > 0) {
+    const seen = [...new Set(scene.skippedOpcodes)].map(
+      (code) => `0x${code.toString(16)}`,
+    );
+    notes.push(
+      `Records skipped by length, unrecognized by this reader: ${seen.join(", ")}.`,
+    );
+  }
+  return {
+    readMode: "streamed",
+    header: scene.header,
+    statistics: scene.statistics,
+    duration: scene.header.durationSec,
+    frameAt: async (t) =>
+      frameFromSet(scene.gaussians, scene.objects, t, cutoff, gate),
+    intervalsAt:
+      gate === null
+        ? () => []
+        : (t) =>
+            scene.chunkIndex
+              .filter((e) => e.t0 <= t && t < e.t1)
+              .map(({ t0, t1 }) => ({ t0, t1 })),
+    transfer: () => transferOf(source),
+    notes,
+  };
+}
+
+/**
+ * A {@link Frame} from a decoded population.
+ *
+ * `stateAtWithObjects` is where the format's decoding ends: it applies the validity window
+ * as a hard gate, drops anything whose marginal has fallen under the file's own cutoff,
+ * moves what is left along its velocity, then composes any Object Track pose. Everything
+ * after this line is drawing.
+ *
+ * `gate`, when the caller has one, is §5.5's other hard gate — the interval of the chunk a
+ * gaussian was stored in, which is not part of a `GaussianSet` and so has to be carried
+ * alongside it.
+ */
+function frameFromSet(set, objects, t, cutoff, gate) {
+  const state = stateAtWithObjects(set, objects, t, cutoff);
+  const total = state.indices.length;
+  const centers = new Float32Array(total * 3);
+  const rotations = new Float32Array(total * 4);
+  const scales = new Float32Array(total * 3);
+  const colors = new Float32Array(total * 4);
+  const coefficients = set.sh === null ? 0 : set.sh.coefficients;
+  const sh =
+    coefficients === 0 ? null : new Uint8Array(total * 3 * coefficients);
+
+  let count = 0;
+  for (let k = 0; k < total; k++) {
+    const i = state.indices[k];
+    if (gate !== null && !(gate.t0[i] <= t && t < gate.t1[i])) continue;
+    centers[count * 3] = state.centers[k * 3];
+    centers[count * 3 + 1] = state.centers[k * 3 + 1];
+    centers[count * 3 + 2] = state.centers[k * 3 + 2];
+    for (let axis = 0; axis < 4; axis++) {
+      rotations[count * 4 + axis] = state.orientations[k * 4 + axis];
+    }
+    scales[count * 3] = set.scales[i * 3];
+    scales[count * 3 + 1] = set.scales[i * 3 + 1];
+    scales[count * 3 + 2] = set.scales[i * 3 + 2];
+    colors[count * 4] = set.colors[i * 4];
+    colors[count * 4 + 1] = set.colors[i * 4 + 1];
+    colors[count * 4 + 2] = set.colors[i * 4 + 2];
+    // The temporal marginal is already folded into `opacity` by `stateAt`.
+    colors[count * 4 + 3] = state.opacity[k];
+    if (sh !== null) {
+      const width = 3 * coefficients;
+      sh.set(
+        set.sh.values.subarray(i * width, i * width + width),
+        count * width,
+      );
+    }
+    count += 1;
+  }
+
+  return {
+    time: t,
+    count,
+    centers: centers.subarray(0, count * 3),
+    scales: scales.subarray(0, count * 3),
+    rotations: rotations.subarray(0, count * 4),
+    colors: colors.subarray(0, count * 4),
+    sh: sh === null ? null : sh.subarray(0, count * 3 * coefficients),
+    shCoefficients: coefficients,
+    shDegree: set.sh === null ? 0 : set.sh.degree,
+  };
+}
+
+/**
+ * Each gaussian's originating chunk interval, when the file makes it recoverable — and
+ * when the file's own chunks agree that it does.
+ *
+ * §5.5: "its gaussians are invisible outside it". The indexed path gets this for free by
+ * reading only the chunks that cover the instant, but `decodeScene` concatenates every
+ * chunk into one `GaussianSet` and keeps no interval, so a front-to-back reader has to
+ * recover the mapping or admit it cannot. It can be recovered exactly when the file carries
+ * a Chunk Index: `assembleGaussians` lays chunks out in the order it visited them, which is
+ * file order, and each index entry says how many gaussians its chunk holds.
+ *
+ * A Chunk Index reached this way has been vouched for by nothing. This path runs precisely
+ * when the Footer did not open, so no summary CRC covered the index, and a per-entry
+ * `gaussian_count` that is wrong in a way the total hides — two entries with their counts
+ * swapped — would assign decoded rows to the wrong intervals and draw a plausible, wrong
+ * scene. So every entry is checked against the Chunk record it names, exactly as
+ * `IndexedDecoder.readChunk` checks it before decoding: the record at `chunk_offset` must
+ * be a Chunk, and its header's `count`, `t0` and `t1` must be the ones the entry claims.
+ * That costs one fixed-size framing read and then the record's own validated range, on a
+ * path already reading the file front to back, and it is the difference between a gate and
+ * a guess.
+ *
+ * A gate is not built unless every one of those checks passes. Nothing here refuses the
+ * file: the gaussians decoded, and the indexed reader — the one whose contract an index
+ * is — was already unusable on this file. An index that disagrees with its own chunks
+ * simply does not get to decide what is visible, and the returned `why` says which record
+ * disagreed and by how much.
+ *
+ * @returns {Promise<{gate: {t0: Float64Array, t1: Float64Array}|null, why: string}>}
+ */
+async function chunkGateOf(scene, source, size, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  const entries = [...scene.chunkIndex].sort(
+    (a, b) => a.chunkOffset - b.chunkOffset,
+  );
+  const count = scene.gaussians.count;
+  if (entries.length === 0) {
+    return {
+      gate: null,
+      why:
+        "This file was read front to back and carries no Chunk Index, so which chunk a " +
+        "gaussian was stored in is not recoverable here.",
+    };
+  }
+  let total = 0;
+  for (const entry of entries) total += entry.gaussianCount;
+  if (total !== count) {
+    return {
+      gate: null,
+      why:
+        `This file's Chunk Index accounts for ${total} gaussians and ${count} were decoded, ` +
+        "so it cannot say which chunk each one came from.",
+    };
+  }
+
+  const offsets = new Set();
+  for (const entry of entries) {
+    if (offsets.has(entry.chunkOffset)) {
+      return {
+        gate: null,
+        why:
+          `This file's Chunk Index names offset ${entry.chunkOffset} more than once, so it ` +
+          "does not cover the decoded Chunk records one to one.",
+      };
+    }
+    offsets.add(entry.chunkOffset);
+  }
+
+  for (const entry of entries) {
+    const mismatch = await chunkDisagreementWithin(
+      entry,
+      source,
+      size,
+      deadline,
+    );
+    if (mismatch === CHUNK_GATE_TIMED_OUT) {
+      return {
+        gate: null,
+        why:
+          `This file's optional Chunk Index visibility check did not settle within ` +
+          `${timeoutMs} ms, so it cannot decide which decoded gaussians are visible.`,
+      };
+    }
+    if (mismatch !== null)
+      return { gate: null, why: `This file's ${mismatch}` };
+  }
+
+  const t0 = new Float64Array(count);
+  const t1 = new Float64Array(count);
+  let at = 0;
+  for (const entry of entries) {
+    t0.fill(entry.t0, at, at + entry.gaussianCount);
+    t1.fill(entry.t1, at, at + entry.gaussianCount);
+    at += entry.gaussianCount;
+  }
+  return { gate: { t0, t1 }, why: "" };
+}
+
+/**
+ * Check one physical Chunk without allowing the optional gate to delay opening forever.
+ *
+ * `IReadable` has no cancellation contract, so a timed-out read may still settle later.
+ * Racing each read against the one gate-wide deadline means no later validation read is
+ * started after that happens: at most one abandoned transport operation remains.
+ */
+async function chunkDisagreementWithin(entry, source, size, deadline) {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) return CHUNK_GATE_TIMED_OUT;
+  let timer;
+  try {
+    return await Promise.race([
+      chunkDisagreement(entry, source, size),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(CHUNK_GATE_TIMED_OUT), remaining);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * How one Chunk Index entry disagrees with the Chunk record it points at, or `null`.
+ *
+ * Only the record header and fixed Chunk fields are fetched. The streamed decode already
+ * consumed the payload; fetching it again merely to compare three fixed fields would make
+ * this optional fallback check another whole-chunk allocation.
+ */
+async function chunkDisagreement(entry, source, size) {
+  const { chunkOffset, chunkLength } = entry;
+  if (chunkOffset < 0 || chunkOffset + RECORD_HEADER_BYTES > size) {
+    return (
+      `Chunk Index entry for [${entry.t0}, ${entry.t1}) spans ` +
+      `[${chunkOffset}, ${chunkOffset + chunkLength}), outside the ${size}-byte resource.`
+    );
+  }
+  let count;
+  let t0;
+  let t1;
+  try {
+    // `chunkLength` belongs to the untrusted index. Read only the fixed framing first,
+    // then use the Chunk record's own length after proving it is representable and inside
+    // the resource. A damaged index cannot turn this optional check into a multi-gigabyte
+    // allocation by exaggerating the range while keeping a valid Chunk offset.
+    const fixedChunkBytes = RECORD_HEADER_BYTES + 24;
+    if (chunkOffset + fixedChunkBytes > size) {
+      return `Chunk Index entry at offset ${chunkOffset} does not contain the fixed Chunk fields.`;
+    }
+    const framed = await source.read(
+      BigInt(chunkOffset),
+      BigInt(fixedChunkBytes),
+    );
+    const head = new Cursor(framed, 0, chunkOffset);
+    const opcode = head.u8();
+    const actualLength = RECORD_HEADER_BYTES + head.u64();
+    if (opcode !== Opcode.Chunk) {
+      return (
+        `Chunk Index points at offset ${chunkOffset}, which holds opcode ` +
+        `0x${opcode.toString(16)} rather than a Chunk.`
+      );
+    }
+    if (actualLength !== chunkLength) {
+      return (
+        `chunk at ${chunkOffset} occupies ${actualLength} bytes and its index entry says ` +
+        `${chunkLength}.`
+      );
+    }
+    if (chunkOffset + actualLength > size) {
+      return `chunk at ${chunkOffset} declares ${actualLength} bytes, past the ${size}-byte resource.`;
+    }
+    t0 = head.f64();
+    t1 = head.f64();
+    head.u32(); // level
+    count = head.u32();
+  } catch (error) {
+    return `Chunk Index entry at offset ${chunkOffset} could not be read back: ${error.message}`;
+  }
+  if (count !== entry.gaussianCount) {
+    return (
+      `chunk at ${chunkOffset} holds ${count} gaussians and its index entry says ` +
+      `${entry.gaussianCount}.`
+    );
+  }
+  if (t0 !== entry.t0 || t1 !== entry.t1) {
+    return (
+      `chunk at ${chunkOffset} covers [${t0}, ${t1}) and its index entry says ` +
+      `[${entry.t0}, ${entry.t1}).`
+    );
+  }
+  return null;
+}
+
+/**
+ * Concatenate several chunks' spherical harmonics into one population-wide block.
+ *
+ * Each chunk merges its own bands, so the only thing left to do is lay the per-gaussian
+ * blocks end to end in the same order `assembleGaussians` lays out everything else.
+ */
+export function concatSh(chunks) {
+  const nonempty = chunks.filter((chunk) => chunk.gaussians.count > 0);
+  const withBands = chunks.filter(
+    (chunk) => chunk.gaussians.count > 0 && chunk.sh !== null && chunk.sh.degree > 0,
+  );
+  if (withBands.length === 0) return null;
+  const degrees = new Set(withBands.map((chunk) => chunk.sh.degree));
+  if (withBands.length !== nonempty.length || degrees.size > 1) {
+    throw new MalformedFile(
+      `chunks covering this instant disagree on SH degree: ${[...degrees].join(", ")}`,
+    );
+  }
+  const { degree, coefficients } = withBands[0].sh;
+  const width = 3 * coefficients;
+  let count = 0;
+  for (const chunk of chunks) count += chunk.gaussians.count;
+  const values = new Uint8Array(count * width);
+  let at = 0;
+  for (const chunk of chunks) {
+    if (chunk.gaussians.count === 0) continue;
+    values.set(chunk.sh.values, at * width);
+    at += chunk.gaussians.count;
+  }
+  return { degree, coefficients, count, values, bands: withBands[0].sh.bands };
+}
+
+// --------------------------------------------------------------------------
+// keyframe-delta
+// --------------------------------------------------------------------------
+
+/**
+ * The `keyframe-delta` model, composed front to back.
+ *
+ * This path is the one exception to the bounded-memory reading above: `@4dgs/core`
+ * composes a `keyframe-delta` file from a byte array rather than from an `IReadable`, so
+ * the whole resource is read before anything is composed. The page says so.
+ */
+async function openKeyframeDelta(source, size) {
+  if (await claimsTerminalFooter(source, size)) {
+    const decoder = await KeyframeDeltaIndexedDecoder.open(source);
+    return indexedKeyframePlayable(
+      decoder,
+      source,
+      await statisticsFromSummary(source, size),
+    );
+  }
+  if (size > KEYFRAME_DELTA_BYTE_LIMIT) {
+    throw new ViewerLimitError(
+      `this truncated keyframe-delta prefix is ${size} bytes; prefix recovery currently needs ` +
+        `one byte array, so this viewer declines anything over ${KEYFRAME_DELTA_BYTE_LIMIT} ` +
+        `bytes rather than attempting the allocation. Complete keyframe-delta files use the ` +
+        `SDK's range-backed indexed reader and have no file-sized allocation.`,
+    );
+  }
+  const data = await source.read(0n, BigInt(size));
+  const sequence = await decodeKeyframeDeltaStreamed(data);
+  const cutoff = effectiveCutoff(sequence.header);
+  const notes = [
+    "This resource is a truncated keyframe-delta prefix. Recovery composes the available " +
+      "prefix whole because it has no Footer or Chunk Index to seek through.",
+  ];
+
+  // The last instant this file can be reconstructed at is the last complete chunk's `t1`
+  // (§11.10), which is the Header's duration for a whole file and less than it for one cut
+  // short. Playing past it would repeat the last chunk's state under a clock that has moved
+  // on — an answer the file does not give — so the timeline stops where the chunks do.
+  //
+  // "Last" is the largest `t1`, not the last element: state chunks tile the timeline in
+  // *time* order and `checkTiling` sorts them by `t0` before checking adjacency, so nothing
+  // requires a file to store them in that order. `sequence.chunks` is file order. Taking the
+  // final element would cut an 8-second scene stored as [4, 8), [0, 4) down to 4 seconds and
+  // call the missing half a truncation. `keyframeDeltaStatesJson` bounds its own probes the
+  // same way, by a maximum over every chunk's `t1`.
+  const chunks = sequence.chunks;
+  let covered = 0;
+  let earliest = 0;
+  for (let i = 0; i < chunks.length; i++) {
+    covered = i === 0 ? chunks[i].t1 : Math.max(covered, chunks[i].t1);
+    earliest = i === 0 ? chunks[i].t0 : Math.min(earliest, chunks[i].t0);
+  }
+  const duration = Math.min(sequence.header.durationSec, covered);
+  if (duration < sequence.header.durationSec) {
+    notes.push(
+      `The chunks that decoded cover [${earliest}, ${covered}), short of the Header's ` +
+        `duration_sec ${sequence.header.durationSec}: the file was cut after a complete ` +
+        `chunk. The timeline here ends where the chunks do rather than extrapolating.`,
+    );
+  }
+
+  const covering = (t) => {
+    for (const chunk of chunks) if (chunk.t0 <= t && t < chunk.t1) return chunk;
+    return null;
+  };
+
+  return {
+    readMode: "keyframe-delta",
+    header: sequence.header,
+    statistics: null,
+    duration,
+    frameAt: async (t) => {
+      const chunk = covering(t);
+      if (chunk === null) {
+        throw new MalformedFile(
+          chunks.length === 0
+            ? "this keyframe-delta file carries no state chunks"
+            : `no state chunk of this keyframe-delta file covers t = ${t}; the chunks that ` +
+                `decoded cover [${earliest}, ${covered})`,
+        );
+      }
+      return reconstructKeyframeDelta(sequence, chunk, t, cutoff);
+    },
+    intervalsAt: (t) => {
+      const chunk = covering(t);
+      return chunk === null ? [] : [{ t0: chunk.t0, t1: chunk.t1 }];
+    },
+    transfer: () => transferOf(source),
+    notes,
+  };
+}
+
+function indexedKeyframePlayable(decoder, source, statistics) {
+  const { header, index } = decoder;
+  const covering = (t) => {
+    for (const entry of index) if (entry.t0 <= t && t < entry.t1) return entry;
+    return null;
+  };
+  return {
+    readMode: "keyframe-delta",
+    header,
+    statistics,
+    duration: header.durationSec,
+    frameAt: async (t) =>
+      frameFromKeyframeState(await decoder.reconstructAt(t)),
+    intervalsAt: (t) => {
+      const entry = covering(t);
+      return entry === null ? [] : [{ t0: entry.t0, t1: entry.t1 }];
+    },
+    transfer: () => transferOf(source),
+    notes: [
+      "This complete keyframe-delta file uses the Chunk Index and fetches only the chain " +
+        "needed for the displayed instant.",
+    ],
+  };
+}
+
+/**
+ * Whether the tail claims to be a complete file rather than coincidental payload magic.
+ *
+ * An actual Footer opcode plus its fixed content length makes the claim even when terminal
+ * magic is damaged. Every other two-signal combination can occur in arbitrary private
+ * payload, so the decoded Footer content must also point to a bounded, structurally framed
+ * Chunk Index summary ending exactly at this tail boundary.
+ */
+async function claimsTerminalFooter(source, size) {
+  if (size < FOOTER_TAIL_BYTES) return false;
+  const offset = size - FOOTER_TAIL_BYTES;
+  const tail = await source.read(BigInt(offset), BigInt(FOOTER_TAIL_BYTES));
+  if (tail.length !== FOOTER_TAIL_BYTES) return false;
+  const opcode = tail[0] === Opcode.Footer;
+  const contentLength =
+    new DataView(tail.buffer, tail.byteOffset, tail.byteLength).getBigUint64(1, true) ===
+    BigInt(FOOTER_TAIL_BYTES - RECORD_HEADER_BYTES - MAGIC.length);
+  const magic = endsWithMagic(tail);
+  if (opcode && contentLength) return true;
+  return (
+    magic &&
+    (opcode || contentLength) &&
+    (await hasKeyframeSummaryBoundary(source, offset, tail))
+  );
+}
+
+function endsWithMagic(data) {
+  const at = data.length - MAGIC.length;
+  for (let i = 0; i < MAGIC.length; i++)
+    if (data[at + i] !== MAGIC[i]) return false;
+  return true;
+}
+
+/** Corroborate a damaged Footer opcode by the bounded summary immediately before it. */
+async function hasKeyframeSummaryBoundary(source, footerOffset, tail) {
+  try {
+    const content = tail.subarray(
+      RECORD_HEADER_BYTES,
+      FOOTER_TAIL_BYTES - MAGIC.length,
+    );
+    const footer = parseFooter(content);
+    const summaryLength = footerOffset - footer.summaryStart;
+    if (
+      footer.summaryStart < MAGIC.length ||
+      summaryLength <= 0 ||
+      summaryLength > MAX_KEYFRAME_DELTA_SUMMARY_BYTES
+    )
+      return false;
+    const scanner = new FrontMatterScanner(source, footerOffset, HEAD_PROBE_BYTES);
+    let end = footer.summaryStart;
+    let hasIndex = false;
+    for await (const record of scanner.records(footer.summaryStart)) {
+      end = record.offset + record.totalLength;
+      hasIndex ||= record.opcode === Opcode.ChunkIndex;
+    }
+    return hasIndex && end === footerOffset;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Read the optional Statistics summary after the indexed keyframe decoder has validated it.
+ *
+ * The current SDK exposes Statistics on gaussian-birth readers but not on
+ * KeyframeDeltaIndexedDecoder. Walk the already-validated summary by record framing and
+ * fetch only the fixed 68-byte Statistics prefix, so sparse camera framing remains bounded.
+ */
+async function statisticsFromSummary(source, size) {
+  const footerOffset = size - FOOTER_TAIL_BYTES;
+  const tail = await source.read(BigInt(footerOffset), BigInt(FOOTER_TAIL_BYTES));
+  const footer = parseFooter(readRecord(new Cursor(tail, 0, footerOffset)).content);
+  if (footer.summaryStart <= 0 || footer.summaryStart >= footerOffset) return null;
+  const scanner = new FrontMatterScanner(source, footerOffset, HEAD_PROBE_BYTES);
+  let statistics = null;
+  for await (const record of scanner.records(footer.summaryStart)) {
+    if (record.opcode !== Opcode.Statistics) continue;
+    statistics = parseStatistics(await scanner.content(record, 68));
+  }
+  return statistics;
+}
+
+function transferOf(source) {
+  return { bytes: source.bytes, reads: source.reads, size: source.total };
+}

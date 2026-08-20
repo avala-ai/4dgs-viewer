@@ -1,0 +1,86 @@
+{
+  "aggregate": {
+    "neverFadesCount": "0",
+    "opacitySum": 0.447059,
+    "positionSum": [
+      -0.761085,
+      -0.435832,
+      -0.903013
+    ],
+    "zeroMotionCount": "0"
+  },
+  "attachments": [],
+  "audioSources": [],
+  "camera": null,
+  "chunkIntervals": [
+    [
+      0.0,
+      1.0
+    ]
+  ],
+  "cutoff": 0.05,
+  "durationSec": 1.0,
+  "gaussianCount": "1",
+  "hasAudio": false,
+  "headerAttributes": {},
+  "library": "4dgs conformance generator",
+  "metadataRecords": [],
+  "profile": "capture",
+  "sample": {
+    "colors": [
+      [
+        0.023529,
+        0.964706,
+        0.847059,
+        0.447059
+      ]
+    ],
+    "motions": [
+      [
+        0.030451,
+        -0.078303,
+        0.063077
+      ]
+    ],
+    "muT": [
+      0.136
+    ],
+    "positions": [
+      [
+        -0.761085,
+        -0.435832,
+        -0.903013
+      ]
+    ],
+    "rotations": [
+      [
+        0.99125,
+        0.108,
+        -0.072,
+        0.024
+      ]
+    ],
+    "scales": [
+      [
+        0.002623,
+        0.002947,
+        0.001849
+      ]
+    ],
+    "sigmaT": [
+      0.19563
+    ],
+    "winHi": [
+      1.0
+    ],
+    "winLo": [
+      0.0
+    ]
+  },
+  "sh": null,
+  "shDegree": 0,
+  "statistics": null,
+  "summaryCrcOk": true,
+  "summaryOffsets": [],
+  "temporalModel": "gaussian-birth"
+}
