@@ -12,6 +12,8 @@
  */
 
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { describe, it } from "node:test";
 
 import {
@@ -42,6 +44,7 @@ import {
   FAMILIES,
   FileReadable,
   NoFooterReadable,
+  REPO_ROOT,
   digest,
   instantsFor,
   round,
@@ -69,6 +72,23 @@ import {
 const GAUSSIAN_BIRTH = variants(FAMILIES.gaussianBirth);
 const KEYFRAME_DELTA = variants(FAMILIES.keyframeDelta);
 const INVALID = variants(FAMILIES.invalid);
+
+describe("the built deployment", () => {
+  it("resolves assets under both a Pages project path and a custom-domain root", () => {
+    const html = readFileSync(path.join(REPO_ROOT, "dist/index.html"), "utf8");
+    const assets = [...html.matchAll(/\b(?:src|href)="([^"]+)"/g)].map((match) => match[1]);
+    assert.ok(assets.length >= 2, "the built page names no script and stylesheet assets");
+
+    for (const asset of assets) {
+      assert.match(asset, /^\.\/assets\//, `${asset} is not relative to the deployed page`);
+      assert.match(
+        new URL(asset, "https://avala-ai.github.io/4dgs-viewer/").pathname,
+        /^\/4dgs-viewer\/assets\//,
+      );
+      assert.match(new URL(asset, "https://viewer.4dgs.dev/").pathname, /^\/assets\//);
+    }
+  });
+});
 
 /**
  * Whether this variant carries a Chunk Index with anything in it.
